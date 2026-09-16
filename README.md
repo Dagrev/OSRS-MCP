@@ -48,9 +48,41 @@ De inspector opent in de browser. Onder **Tools** staat `ping`; die geeft
 
 ## Beschikbare tools
 
-| Tool   | Beschrijving                                          |
-| ------ | ----------------------------------------------------- |
-| `ping` | Bereikbaarheidstest; geeft de servertijd (ISO 8601).  |
+| Tool         | Argumenten                     | Beschrijving                                         |
+| ------------ | ------------------------------ | ---------------------------------------------------- |
+| `ping`       | —                              | Bereikbaarheidstest; geeft de servertijd (ISO 8601). |
+| `get_skills` | `username`, `accountType`      | Level, XP en rank per skill uit de OSRS Hiscores.    |
 
-Echte tools volgen in ORS-005 en verder.
+`accountType` is optioneel en is er een van `normal` (standaard), `ironman`,
+`hardcore_ironman`, `ultimate_ironman`, `group_ironman` of
+`hardcore_group_ironman`.
+
+Drie dingen om te weten bij `get_skills`:
+
+- **Gebruik de character name, niet de naam van het Jagex-account.** De hiscores
+  kennen `Mr Bilel`, niet `Dagrev#2898`.
+- **De hiscores lopen achter op het spel.** Ze verversen niet real-time, dus een
+  net behaald level kan ontbreken.
+- **Een `-1` in de API betekent "niet op de hiscores", niet "level 0".** De tool
+  geeft daar een streepje of "niet gerangschikt" voor terug.
+
+### Group Ironman
+
+Group Ironman heeft geen eigen `index_lite`-tabel — geverifieerd tegen de live
+API: elke plausibele padnaam geeft een 303-redirect, dezelfde respons als een
+verzonnen pad (een bestaand pad met een onbekende speler geeft 404). GIM-accounts
+staan wél in de normale tabel, want die bevat alle accounttypes.
+
+`group_ironman` en `hardcore_group_ironman` lezen daarom de normale tabel. Dat is
+er als eigen optie in gelaten omdat "ik ben een group ironman, dus `ironman`"
+anders een 404 oplevert; nu krijg je het goede antwoord plus een regel die
+uitlegt dat de rank tussen álle spelers is, niet binnen de group-ironmen.
+
+De skillvolgorde staat hardgecodeerd in `SKILL_ORDER` in `src/hiscores.ts` — de
+hiscores geven geen kolomnamen mee, dus de volgorde ís de identificatie. Nieuwe
+skills komen altijd achteraan erbij (zo is Sailing op index 24 gekomen). Komt er
+een skill bij die de server nog niet kent, dan valt de parser daar niet over maar
+zet er een placeholdernaam neer plus een waarschuwing in de uitvoer.
+
+Meer bronnen (quests, wiki, lokale plugindata) volgen in ORS-006 en verder.
 # OSRS-MCP
