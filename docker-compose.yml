@@ -11,6 +11,9 @@ services:
       # zeggen get_bank en get_inventory dat de bron onbereikbaar is — niet
       # dat de bank leeg is.
       OSRS_MCP_DATA_DIR: /data
+      # Hoe lang een sessie (en dus het serverproces erachter) blijft leven na
+      # de laatste request. Zie de toelichting bij `--stateful` in de Dockerfile.
+      SESSION_TIMEOUT: 900000
     mem_limit: 512m
     healthcheck:
       test: ["CMD", "/app/healthcheck.sh"]

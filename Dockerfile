@@ -22,8 +22,19 @@ COPY healthcheck.sh ./
 RUN chmod +x healthcheck.sh
 
 ENV PORT=3000
+
+# Sessieduur in milliseconden; zie `--stateful` hieronder. Een kwartier is ruim
+# genoeg voor een gesprek met Claude en kort genoeg om processen op te ruimen.
+ENV SESSION_TIMEOUT=900000
+
 EXPOSE 3000
 
 # stdout is het protocolkanaal van de server; supergateway leest dat en logt zelf
 # naar stderr. Niets in deze image mag naar stdout van de serverprocessen praten.
-CMD ["sh", "-c", "exec supergateway --stdio 'node /app/dist/index.js' --outputTransport streamableHttp --port \"$PORT\""]
+#
+# `--stateful` is niet optioneel. Zonder die vlag draait supergateway stateless
+# en start het per request een eigen `node dist/index.js`, die daarna niet wordt
+# opgeruimd: nagemeten liep de container in 21 requests naar 455 MiB van de
+# 512 MiB en zou hij dus binnen een gesprek OOM-gekilled worden. Met `--stateful`
+# hoort een sessie bij één proces, en `--sessionTimeout` ruimt die op.
+CMD ["sh", "-c", "exec supergateway --stdio 'node /app/dist/index.js' --outputTransport streamableHttp --stateful --sessionTimeout \"$SESSION_TIMEOUT\" --port \"$PORT\""]
