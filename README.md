@@ -11,7 +11,8 @@ Documentatie, tickets en werklogs staan in de Obsidian-vault onder
 ## Stack
 
 - Node + TypeScript, officiële `@modelcontextprotocol/sdk`
-- stdio-transport (lokale server, geen netwerkpoort)
+- stdio-transport; op de homelab zet [supergateway](https://github.com/supercorp-ai/supergateway)
+  daar HTTP voor in een Docker-container (zie [Deployen](#deployen-op-de-homelab))
 
 ## Installeren
 
@@ -48,11 +49,16 @@ De inspector opent in de browser. Onder **Tools** staat `ping`; die geeft
 
 ## Beschikbare tools
 
-| Tool         | Argumenten                | Beschrijving                                              |
-| ------------ | ------------------------- | --------------------------------------------------------- |
-| `ping`       | —                         | Bereikbaarheidstest; geeft de servertijd (ISO 8601).       |
-| `get_skills` | `username`, `accountType` | Level, XP en rank per skill uit de OSRS Hiscores.          |
-| `get_quests` | `username`, `filter`      | Status per quest (niet gestart / bezig / afgerond) via WikiSync. |
+| Tool              | Argumenten                             | Beschrijving                                                     |
+| ----------------- | -------------------------------------- | ---------------------------------------------------------------- |
+| `ping`            | —                                      | Bereikbaarheidstest; geeft de servertijd (ISO 8601).             |
+| `get_skills`      | `username`, `accountType`              | Level, XP en rank per skill uit de OSRS Hiscores.                |
+| `get_quests`      | `username`, `filter`                   | Status per quest (niet gestart / bezig / afgerond) via WikiSync.  |
+| `lookup_item`     | `name`                                 | Item-eigenschappen uit de OSRS Wiki: ID, waarde, bonussen.       |
+| `lookup_monster`  | `name`                                 | Monster-stats uit de OSRS Wiki: combat, slayer, zwaktes.         |
+| `get_drop_table`  | `monster`, `include_rare_drop_table`   | Drop table met de uitgerekende kans per kill.                    |
+| `get_inventory`   | —                                      | Laatste inventory-snapshot van de RuneLite-plugin.               |
+| `get_bank`        | —                                      | Laatste bank-snapshot van de RuneLite-plugin.                    |
 
 `accountType` is optioneel en is er een van `normal` (standaard), `ironman`,
 `hardcore_ironman`, `ultimate_ironman`, `group_ironman` of
@@ -137,5 +143,89 @@ Dit is community-infrastructuur, geen officiële Jagex-API: het formaat kan
 wijzigen. `src/wikisync.ts` parst daarom defensief — onbekende questwaarden
 worden overgeslagen met een waarschuwing in de uitvoer in plaats van een crash.
 
-Meer bronnen (wiki, lokale plugindata) volgen in ORS-007 en verder.
-# OSRS-MCP
+### Lokale plugindata (bank en inventory)
+
+`get_inventory` en `get_bank` lezen de JSON-snapshots die de RuneLite-plugin
+["OSRS Item Check"](../OSRS%20item%20check) bij elke containerwijziging
+wegschrijft. Welke map dat is, bepaalt de environment-variabele
+`OSRS_MCP_DATA_DIR`; staat die niet, dan is het `~/.runelite/osrs-item-check/`
+— hetzelfde standaardpad als in de pluginconfig, zodat het zonder instellen
+werkt als de server op de spelmachine draait.
+
+Het antwoord bevat altijd het tijdstempel uit de snapshot én de wijzigingstijd
+van het bestand, zodat te zien is hoe oud de data is. Is de snapshot ouder dan
+een kwartier, dan staat er een waarschuwing bij.
+
+**Deze tools geven nooit een lege lijst bij een storing.** Dat onderscheid is de
+kern ervan: een lege bank teruggeven bij een onbereikbare mount laat Claude
+concluderen dat je niets hebt. Vijf uitkomsten, vijf boodschappen:
+
+| Situatie                                     | Uitkomst                                      |
+| -------------------------------------------- | --------------------------------------------- |
+| Map bestaat niet, of geen leesrechten        | fout — bron niet te vinden / niet te lezen    |
+| Map bestaat en is helemaal leeg              | fout — mount waarschijnlijk niet aangehaakt   |
+| Map heeft inhoud, dit bestand niet           | fout — plugin heeft nog niet geschreven       |
+| Bestand leeg of geen geldige snapshot        | fout — leesprobleem, probeer opnieuw          |
+| Bestand gelezen, nul items                   | **geen fout** — de container is echt leeg     |
+
+Alleen de laatste regel mag "leeg" zeggen. Een niet-aangehaakte netwerkmount
+laat gewoon een lege map achter, dus "alles ontbreekt" en "dit ene bestand
+ontbreekt" zijn expres verschillende meldingen.
+
+De bank wordt door de plugin alleen herschreven als je hem in-game opent; die
+snapshot is dus vaak dagen oud zonder dat er iets mis is.
+
+## Deployen op de homelab
+
+De server draait als Docker-container in LXC 108 (`osrsmcp`,
+`192.168.1.154`) op de Proxmox-host, bereikbaar op
+`http://192.168.1.154:3000/mcp`. Alleen LAN, plain HTTP, geen authenticatie —
+gelijk aan de Obsidian-MCP, en het zijn alleen leestools.
+
+Intern blijft de server stdio; `supergateway` zet daar HTTP voor. Er staat geen
+netwerkcode in `src/`.
+
+### Eerste keer
+
+```
+ssh pve
+pct enter 108
+git clone https://github.com/Dagrev/OSRS-MCP.git /opt/osrs-mcp
+cd /opt/osrs-mcp
+docker compose up -d --build
+```
+
+De image bouwt de server zelf (`npm ci` + `npm run build`); er wordt nooit een
+`dist/` van een desktop ingekopieerd.
+
+### Nieuwe versie uitrollen
+
+Push naar `main` en dan in LXC 108:
+
+```
+cd /opt/osrs-mcp
+git pull
+docker compose up -d --build
+```
+
+`--build` is niet optioneel: zonder die vlag hergebruikt compose de oude image
+en verandert er niets, ook al is de code bijgewerkt.
+
+### Controleren
+
+```
+docker compose ps          # moet "Up" en "healthy" zijn
+docker compose logs -f     # supergateway en de server loggen naar stderr
+```
+
+De healthcheck doet een GET op `/mcp` en verwacht een 4xx. Dat lijkt vreemd maar
+is opzet: `streamableHttp` staat alleen POST toe, dus een 405 is het bewijs dat
+supergateway leeft en `/mcp` routeert. Een POST `initialize` zou meer bewijzen,
+maar supergateway start per sessie een kindproces en een healthcheck sluit die
+sessie nooit af — elke 30 seconden zou dat een lek zijn. Zie de toelichting in
+`healthcheck.sh`.
+
+### Lokaal blijven werken
+
+De container verandert niets aan de lokale werkwijze: `npm start` (stdio) en
+`npm run inspect` doen het onveranderd.

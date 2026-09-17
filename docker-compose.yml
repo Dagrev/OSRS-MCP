@@ -1,0 +1,19 @@
+services:
+  osrs-mcp:
+    build: .
+    container_name: osrs-mcp
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # De map met de snapshots van de RuneLite-plugin. Het volume dat hier
+      # onder komt te hangen is ORS-012; tot die tijd bestaat /data niet en
+      # zeggen get_bank en get_inventory dat de bron onbereikbaar is — niet
+      # dat de bank leeg is.
+      OSRS_MCP_DATA_DIR: /data
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
