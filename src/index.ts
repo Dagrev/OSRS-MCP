@@ -17,6 +17,16 @@ import {
   type WikiSyncResult,
 } from "./wikisync.js";
 import {
+  CONTAINERS,
+  DATA_DIR_ENV,
+  PluginDataError,
+  STALE_AFTER_SECONDS,
+  dataDir,
+  readContainer,
+  type ContainerData,
+  type ContainerKind,
+} from "./plugindata.js";
+import {
   WikiError,
   fetchDropTable,
   lookupItem,
@@ -671,6 +681,164 @@ server.registerTool(
       return { content: [{ type: "text", text: message }], isError: true };
     }
   },
+);
+
+/* ------------------------------------------------------------------ *
+ * Lokale plugindata — bank en inventory
+ * ------------------------------------------------------------------ */
+
+/** Leeftijd in mensentaal; de exacte seconden staan er in het antwoord bij. */
+const formatAge = (seconds: number): string => {
+  if (seconds < 60) return `${seconds} seconde(n)`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} minuut/minuten`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)} uur`;
+  return `${Math.round(seconds / 86400)} dag(en)`;
+};
+
+/**
+ * Dezelfde item-ID kan over meerdere slots verdeeld staan (alles wat niet
+ * stapelt). Voor de vraag "wat heb ik" is het totaal per item het antwoord;
+ * het aantal bezette slots komt er apart bij, want dat is wat over vrije
+ * ruimte gaat.
+ */
+const aggregateItems = (data: ContainerData) => {
+  const totals = new Map<number, { name: string; quantity: number; slots: number }>();
+  for (const item of data.items) {
+    const existing = totals.get(item.id);
+    if (existing) {
+      existing.quantity += item.quantity;
+      existing.slots += 1;
+    } else {
+      totals.set(item.id, { name: item.name, quantity: item.quantity, slots: 1 });
+    }
+  }
+  return [...totals.entries()]
+    .map(([id, value]) => ({ id, ...value }))
+    .sort((a, b) => b.quantity - a.quantity || a.name.localeCompare(b.name, "nl"));
+};
+
+const formatContainer = (data: ContainerData): string => {
+  const rows = aggregateItems(data);
+  const label = CONTAINERS[data.kind].label;
+
+  const lines = [
+    `# ${data.kind === "bank" ? "Bank" : "Inventory"} volgens de RuneLite-plugin`,
+    "",
+    `- Tijdstempel uit de snapshot: ${data.timestamp}` +
+      (data.ageSeconds === null
+        ? " (niet als datum te lezen)"
+        : ` — ${formatAge(data.ageSeconds)} oud`),
+    `- Bestand voor het laatst gewijzigd: ${data.fileModified}`,
+    `- Gelezen uit: ${data.path}`,
+  ];
+
+  if (data.ageSeconds !== null && data.ageSeconds > STALE_AFTER_SECONDS) {
+    lines.push(
+      `- **Let op: deze snapshot is ${formatAge(data.ageSeconds)} oud.** ` +
+        (data.kind === "bank"
+          ? "Voor de bank is dat normaal — die wordt alleen herschreven als de " +
+            "bank in-game geopend wordt. Behandel het als de laatst bekende " +
+            "stand, niet als de huidige."
+          : "De inventory verandert tijdens het spelen continu, dus dit is " +
+            "vrijwel zeker niet de huidige stand. Waarschijnlijk is de client " +
+            "afgesloten of de plugin uit."),
+    );
+  }
+
+  lines.push("");
+
+  if (rows.length === 0) {
+    // Dit is het enige pad waarop "leeg" ook echt leeg betekent: het bestand is
+    // gelezen en bevat een geldige, lege lijst.
+    lines.push(
+      `De ${label} is leeg volgens deze snapshot. Dat is een gelezen waarde, ` +
+        "geen storing: het bestand was goed leesbaar en bevatte nul items.",
+    );
+  } else {
+    const slots = data.items.length;
+    lines.push(
+      `${rows.length} verschillend(e) item(s) over ${slots} bezet(te) slot(s)` +
+        (data.kind === "inventory" ? ` van 28 — ${28 - slots} vrij.` : "."),
+      "",
+      "| Item | Aantal | Item-ID | Slots |",
+      "| --- | ---: | ---: | ---: |",
+    );
+    for (const row of rows) {
+      lines.push(
+        `| ${row.name} | ${row.quantity.toLocaleString("nl-NL")} | ${row.id} | ${row.slots} |`,
+      );
+    }
+  }
+
+  if (data.skippedItemCount > 0) {
+    lines.push(
+      "",
+      `Let op: ${data.skippedItemCount} regel(s) in het bestand hadden niet de ` +
+        "vorm die deze server verwacht en zijn overgeslagen. Het totaal is dus " +
+        "mogelijk niet compleet; mogelijk is het formaat van de plugin gewijzigd.",
+    );
+  }
+
+  lines.push(
+    "",
+    "Deze data komt van de plugin op de spelmachine, niet uit het spel zelf. Hij " +
+      "is zo oud als het tijdstempel hierboven zegt; er wordt niets gecached, dus " +
+      "opnieuw opvragen leest het bestand opnieuw.",
+  );
+
+  return lines.join("\n");
+};
+
+/** Elke plugindata-tool handelt fouten hetzelfde af. */
+const respondWithContainer = async (kind: ContainerKind) => {
+  try {
+    return { content: [{ type: "text" as const, text: formatContainer(await readContainer(kind)) }] };
+  } catch (error: unknown) {
+    // De boodschap van PluginDataError legt zelf uit wélk soort probleem het is
+    // en, belangrijker, dat het geen lege container betekent.
+    const message =
+      error instanceof PluginDataError
+        ? error.message
+        : `Onverwachte fout bij het lezen van de ${CONTAINERS[kind].label}: ${
+            error instanceof Error ? error.message : String(error)
+          }`;
+    const kindLabel = error instanceof PluginDataError ? error.kind : "unexpected";
+    log(`get_${kind} mislukt (${kindLabel}): ${message}`);
+    return { content: [{ type: "text" as const, text: message }], isError: true };
+  }
+};
+
+/** Dezelfde toelichting voor beide tools; alleen de container verschilt. */
+const containerToolDescription = (kind: ContainerKind) =>
+  `Leest de laatste ${CONTAINERS[kind].label}-snapshot die de RuneLite-plugin "OSRS ` +
+  `Item Check" heeft weggeschreven, met het tijdstempel erbij zodat te zien is hoe ` +
+  `oud de data is. ` +
+  (kind === "bank"
+    ? "De bank wordt alleen herschreven als die in-game geopend is, dus dit is de " +
+      "stand van de laatste keer bankieren. "
+    : "De inventory wordt bij elke wijziging herschreven. ") +
+  `Is de bron niet te lezen, dan komt er een foutmelding — nooit een lege lijst. ` +
+  `De datamap is in te stellen met de environment-variabele ${DATA_DIR_ENV} ` +
+  `(nu: ${dataDir()}).`;
+
+server.registerTool(
+  "get_inventory",
+  {
+    title: "OSRS inventory ophalen",
+    description: containerToolDescription("inventory"),
+    inputSchema: {},
+  },
+  async () => respondWithContainer("inventory"),
+);
+
+server.registerTool(
+  "get_bank",
+  {
+    title: "OSRS bank ophalen",
+    description: containerToolDescription("bank"),
+    inputSchema: {},
+  },
+  async () => respondWithContainer("bank"),
 );
 
 async function main() {
