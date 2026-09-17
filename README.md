@@ -185,6 +185,14 @@ gelijk aan de Obsidian-MCP, en het zijn alleen leestools.
 Intern blijft de server stdio; `supergateway` zet daar HTTP voor. Er staat geen
 netwerkcode in `src/`.
 
+De gateway draait **stateful**: één sessie hoort bij één serverproces, en
+`SESSION_TIMEOUT` (compose, standaard 15 minuten) ruimt dat op na de laatste
+request. Stateless start supergateway per request een eigen proces en ruimt het
+niet op — nagemeten liep de container daarmee in 21 requests naar 455 MiB van de
+512 MiB. Gevolg voor clients: na `initialize` moet de `mcp-session-id`-header
+meegestuurd worden. Dat doet elke MCP-client volgens de spec; een handmatige
+`curl` zonder die header krijgt terecht "No valid session ID provided".
+
 ### Eerste keer
 
 ```
