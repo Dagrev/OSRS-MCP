@@ -200,8 +200,22 @@ export function parseQuests(raw: unknown): {
   return { quests, unknownStateCount };
 }
 
+/**
+ * WikiSync matcht op de display name zelf, hoofdletterongevoelig, en rekent
+ * een underscore NIET als spatie — `Mr_Bilel` geeft `NO_USER_DATA` terwijl
+ * `Mr Bilel` data geeft. De hiscores zijn daar wél soepel in. Underscores
+ * worden daarom omgezet; OSRS-namen bevatten ze niet, het is de oude
+ * URL-vriendelijke schrijfwijze van een spatie.
+ *
+ * Spaties wegláten gebeurt bewust niet: `MrBilel` en `Mr Bilel` zijn twee
+ * verschillende accounts (nagemeten op de hiscores, 2026-09-17). "Behulpzaam"
+ * normaliseren zou dan stilletjes de data van een vreemde teruggeven.
+ */
+const normaliseName = (username: string): string =>
+  username.trim().replace(/_/g, " ");
+
 export async function fetchWikiSync(username: string): Promise<WikiSyncResult> {
-  const name = username.trim();
+  const name = normaliseName(username);
   const key = name.toLowerCase();
 
   const hit = cache.get(key);
@@ -249,8 +263,12 @@ export async function fetchWikiSync(username: string): Promise<WikiSyncResult> {
           "1. Installeer de plugin \"WikiSync\" uit de RuneLite Plugin Hub en zet hem aan.\n" +
           "2. Log één keer in op het account op een gewone wereld.\n" +
           "3. Probeer het daarna opnieuw — de sync gebeurt bij het inloggen.\n" +
+          "Staat de plugin al aan? Dan is hij waarschijnlijk pas ná het inloggen " +
+          "geladen; WikiSync verstuurt alleen op het inlogmoment, dus opnieuw " +
+          "inloggen is genoeg.\n" +
           "Controleer ook de schrijfwijze: gebruik de character name, niet de naam " +
-          "van het Jagex-account.",
+          "van het Jagex-account. WikiSync matcht op de display name zelf en telt " +
+          "spaties mee — \"MrBilel\" en \"Mr Bilel\" zijn twee verschillende accounts.",
       );
     }
 

@@ -100,6 +100,12 @@ alle quests, ook als er gefilterd wordt.
 4. **Log één keer in op het account op een gewone wereld.** De sync gebeurt bij
    het inloggen, niet bij het opstarten van de client.
 
+Let op de volgorde in stap 3 en 4: installeer je WikiSync terwijl je al ingelogd
+bent, dan is het inlogmoment al voorbij en wordt er niets verstuurd. In de
+RuneLite-log is dat te zien als een `Loading external plugin "wikisync"`-regel
+ná de regel waarin het accountprofiel wordt aangemaakt. Opnieuw inloggen lost het
+op.
+
 Is er nooit gesynchroniseerd, dan geeft de tool een melding met precies deze
 stappen erin in plaats van een lege lijst.
 
@@ -111,6 +117,11 @@ Drie dingen om te weten:
   respons is het moment van het antwoord, niet van de sync — nagemeten: twee
   opvragingen een seconde na elkaar geven twee verschillende, actuele tijden, en
   er komt geen `Last-Modified`-header mee.
+- **Spaties tellen mee in de naam.** WikiSync matcht op de display name zelf,
+  hoofdletterongevoelig, maar rekent een underscore niet als spatie zoals de
+  hiscores dat doen. De tool zet underscores daarom om naar spaties. Spaties
+  wéglaten doet hij bewust niet: `MrBilel` en `Mr Bilel` zijn twee verschillende
+  accounts, dus "behulpzaam" normaliseren zou de data van een vreemde opleveren.
 - **Er is geen accounttype-parameter.** Het pad eindigt op een *wereldtype*, en
   alleen `STANDARD` is opvraagbaar; `IRONMAN`, `GROUP_IRONMAN`, `DEADMAN` en
   `LEAGUE` geven allemaal HTTP 400 "Cannot query data for this world type".
