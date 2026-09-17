@@ -10,6 +10,8 @@
  * Endpoint en formaat geverifieerd tegen de live API op 2026-09-17.
  */
 
+import { USER_AGENT } from "./useragent.js";
+
 const BASE_URL = "https://sync.runescape.wiki/runelite/player";
 
 /**
@@ -229,7 +231,7 @@ export async function fetchWikiSync(username: string): Promise<WikiSyncResult> {
   try {
     response = await fetch(url, {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      headers: { "User-Agent": "osrs-mcp/0.1.0 (persoonlijke MCP-server)" },
+      headers: { "User-Agent": USER_AGENT },
     });
   } catch (error: unknown) {
     if (error instanceof Error && error.name === "TimeoutError") {

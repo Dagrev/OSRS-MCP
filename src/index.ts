@@ -16,6 +16,17 @@ import {
   type QuestStatus,
   type WikiSyncResult,
 } from "./wikisync.js";
+import {
+  WikiError,
+  fetchDropTable,
+  lookupItem,
+  lookupMonster,
+  type DropTable,
+  type ItemLookup,
+  type ItemVersion,
+  type MonsterLookup,
+  type MonsterVersion,
+} from "./wiki.js";
 
 // Let op: stdout is het MCP-protocolkanaal. Alles wat naar stdout wordt
 // geschreven breekt de verbinding met de client. Loggen gaat naar stderr.
@@ -240,6 +251,420 @@ server.registerTool(
               error instanceof Error ? error.message : String(error)
             }`;
       log(`get_quests mislukt voor "${username}": ${message}`);
+      return { content: [{ type: "text", text: message }], isError: true };
+    }
+  },
+);
+
+/* ------------------------------------------------------------------ *
+ * OSRS Wiki — items, monsters en drop tables
+ * ------------------------------------------------------------------ */
+
+/**
+ * Elke wiki-naam die in de uitvoer komt, krijgt hetzelfde voorbehoud mee: de
+ * wiki-naam kan afwijken van de in-game naam. Het koppelen van in-game data
+ * aan wiki-pagina's is ORS-009; hier wordt het alleen gesignaleerd.
+ */
+const WIKI_NAME_NOTE =
+  "Namen op de wiki wijken soms af van de in-game itemnaam: varianten staan " +
+  "onder een eigen paginanaam met een achtervoegsel tussen haakjes.";
+
+/** Een regel "Label: waarde", of niets als de waarde ontbreekt. */
+const field = (label: string, value: string | number | null | undefined): string[] =>
+  value === null || value === undefined || value === "" ? [] : [`- ${label}: ${value}`];
+
+const nl = (n: number): string => n.toLocaleString("nl-NL");
+
+/**
+ * Bonustabellen tonen alleen als er tenminste één waarde in staat.
+ *
+ * `signed` zet een `+` voor positieve waarden — passend voor bonussen, maar
+ * niet voor skill-levels: "Attack +97" suggereert een bonus terwijl het een
+ * level is.
+ */
+const bonusRow = (
+  stats: Record<string, number | null>,
+  signed = true,
+): string | null => {
+  const filled = Object.entries(stats).filter(([, v]) => v !== null);
+  if (filled.length === 0) return null;
+  return filled
+    .map(([k, v]) => `${k} ${signed && v! > 0 ? "+" : ""}${v}`)
+    .join(" · ");
+};
+
+const formatItemVersion = (version: ItemVersion, showHeading: boolean): string[] => {
+  const lines: string[] = [];
+  if (showHeading) {
+    // `default_version` alleen noemen als de pagina meerdere versies heeft;
+    // anders staat het bij elke variant en zegt het niets. Zie lookupItem.
+    const marker = version.isBaseItem
+      ? " (het gewone item)"
+      : version.hasSiblingVersions && version.isDefault
+        ? " (standaardversie van deze pagina)"
+        : "";
+    lines.push(
+      "",
+      `## ${version.pageName}` +
+        (version.versionAnchor ? ` — versie "${version.versionAnchor}"` : "") +
+        marker,
+    );
+  }
+
+  if (version.examine) lines.push("", `_${version.examine}_`, "");
+
+  lines.push(
+    ...field("Item-ID", version.itemIds.length > 0 ? version.itemIds.join(", ") : null),
+    ...field("Members", version.membersOnly === null ? null : version.membersOnly ? "ja" : "nee"),
+    ...field(
+      "Verhandelbaar",
+      version.tradeable === null ? null : version.tradeable ? "ja" : "nee",
+    ),
+    ...field("Winkelwaarde", version.value === null ? null : `${nl(version.value)} gp`),
+    ...field(
+      "High alchemy",
+      version.highAlchemyValue === null ? null : `${nl(version.highAlchemyValue)} gp`,
+    ),
+    ...field("Gewicht", version.weight === null ? null : `${version.weight} kg`),
+    ...field("Kooplimiet", version.buyLimit === null ? null : `${nl(version.buyLimit)} per 4 uur`),
+    ...field("Questitem voor", version.quest),
+    ...field("Uitgebracht", version.releaseDate),
+    ...field("Verwijderd", version.removalDate),
+  );
+
+  const b = version.bonuses;
+  if (b) {
+    lines.push("", "### Uitrusting");
+    lines.push(
+      ...field("Slot", b.slot),
+      ...field("Combat style", b.combatStyle),
+      ...field(
+        "Aanvalssnelheid",
+        b.attackSpeed === null ? null : `${b.attackSpeed} ticks (${(b.attackSpeed * 0.6).toFixed(1)} s)`,
+      ),
+      ...field("Bereik", b.attackRange),
+    );
+    const attack = bonusRow(b.attack);
+    const defence = bonusRow(b.defence);
+    const other = bonusRow(b.other);
+    if (attack) lines.push(`- Attack bonus: ${attack}`);
+    if (defence) lines.push(`- Defence bonus: ${defence}`);
+    if (other) lines.push(`- Overig: ${other}`);
+  }
+
+  return lines;
+};
+
+const formatItem = (result: ItemLookup): string => {
+  const first = result.versions[0]!;
+  const lines = [
+    `# ${first.itemName}`,
+    ...(result.cached ? ["", "_Uit cache, maximaal een uur oud._"] : []),
+  ];
+
+  if (result.versions.length > 1) {
+    lines.push(
+      "",
+      `De wiki kent ${result.versions.length} items met deze naam. Het gewone item ` +
+        "staat bovenaan; de rest zijn varianten met een eigen item-ID " +
+        "(quest-, minigame- of league-versies), die alleen in die context bestaan.",
+    );
+  }
+
+  for (const version of result.versions) {
+    lines.push(...formatItemVersion(version, result.versions.length > 1));
+  }
+
+  lines.push(
+    "",
+    WIKI_NAME_NOTE,
+    "Geen Grand Exchange-prijs: die komt uit een andere bron dan de wiki-infobox. " +
+      "De winkelwaarde hierboven is de basiswaarde uit het spel, niet de handelsprijs.",
+  );
+  return lines.join("\n");
+};
+
+server.registerTool(
+  "lookup_item",
+  {
+    title: "OSRS-item opzoeken",
+    description:
+      "Zoekt een item op bij de OSRS Wiki en geeft de belangrijkste eigenschappen: " +
+      "item-ID, examine, waarde, high alchemy, gewicht, kooplimiet en — als het " +
+      "uitrusting is — de aanvals- en verdedigingsbonussen. Geen Grand " +
+      "Exchange-prijs; dat is een aparte bron.",
+    inputSchema: {
+      name: z
+        .string()
+        .describe("De itemnaam zoals in het spel of op de wiki, bijvoorbeeld 'Abyssal whip'."),
+    },
+  },
+  async ({ name }) => {
+    try {
+      return { content: [{ type: "text", text: formatItem(await lookupItem(name)) }] };
+    } catch (error: unknown) {
+      const message =
+        error instanceof WikiError
+          ? error.message
+          : `Onverwachte fout bij het opzoeken van het item: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+      log(`lookup_item mislukt voor "${name}": ${message}`);
+      return { content: [{ type: "text", text: message }], isError: true };
+    }
+  },
+);
+
+const formatMonsterVersion = (version: MonsterVersion, showHeading: boolean): string[] => {
+  const lines: string[] = [];
+  if (showHeading) {
+    lines.push(
+      "",
+      `## ${version.versionAnchor ?? version.pageName}` +
+        (version.isDefault ? " (standaardversie)" : ""),
+    );
+  }
+
+  if (version.examine) lines.push("", `_${version.examine}_`, "");
+
+  lines.push(
+    ...field("Combat level", version.combatLevel),
+    ...field("Hitpoints", version.hitpoints),
+    ...field("Max hit", version.maxHits.length > 0 ? version.maxHits.join(" / ") : null),
+    ...field(
+      "Aanvalssnelheid",
+      version.attackSpeed === null
+        ? null
+        : `${version.attackSpeed} ticks (${(version.attackSpeed * 0.6).toFixed(1)} s)`,
+    ),
+    ...field(
+      "Aanvalsstijl",
+      version.attackStyles.length > 0 ? version.attackStyles.join(", ") : null,
+    ),
+    ...field(
+      "Attributen",
+      version.attributes.length > 0 ? version.attributes.join(", ") : null,
+    ),
+    ...field("Grootte", version.size === null ? null : `${version.size}x${version.size}`),
+    ...field("Giftig", version.poisonous),
+    ...field("Monster-ID", version.monsterIds.length > 0 ? version.monsterIds.join(", ") : null),
+    ...field("Members", version.membersOnly === null ? null : version.membersOnly ? "ja" : "nee"),
+    ...field("Uitgebracht", version.releaseDate),
+  );
+
+  const slayer = version.slayer;
+  if (slayer.level !== null || slayer.categories.length > 0) {
+    lines.push("", "### Slayer");
+    lines.push(
+      ...field("Vereist level", slayer.level),
+      ...field("XP per kill", slayer.experience),
+      ...field("Categorie", slayer.categories.length > 0 ? slayer.categories.join(", ") : null),
+      ...field(
+        "Toegewezen door",
+        slayer.assignedBy.length > 0 ? slayer.assignedBy.join(", ") : null,
+      ),
+    );
+  }
+
+  const stats = bonusRow(version.combatStats, false);
+  const attack = bonusRow(version.attackBonuses);
+  const defence = bonusRow(version.defenceBonuses);
+  const otherBonuses = bonusRow(version.otherBonuses);
+  if (stats || attack || defence || otherBonuses || version.flatArmour !== null) {
+    lines.push("", "### Combat stats");
+    if (stats) lines.push(`- Levels: ${stats}`);
+    if (attack) lines.push(`- Attack bonus per type: ${attack}`);
+    if (otherBonuses) lines.push(`- Overige bonussen: ${otherBonuses}`);
+    if (defence) lines.push(`- Defence bonus: ${defence}`);
+    lines.push(...field("Flat armour", version.flatArmour));
+  }
+
+  lines.push("", "### Zwaktes en weerstanden");
+  if (version.elementalWeakness) {
+    lines.push(
+      `- Elementaire zwakte: ${version.elementalWeakness.element}` +
+        (version.elementalWeakness.percent === null
+          ? ""
+          : ` (+${version.elementalWeakness.percent}%)`),
+    );
+  } else {
+    lines.push(
+      "- Elementaire zwakte: niet vermeld in de infobox. Dat betekent niet " +
+        "automatisch dat het monster er geen heeft.",
+    );
+  }
+
+  const resistances = Object.entries(version.resistances).filter(([, v]) => v !== null);
+  for (const [label, value] of resistances) lines.push(`- ${label}: ${value}`);
+
+  if (defence) {
+    lines.push(
+      "- De defence bonussen hierboven zijn de praktische zwakte: hoe lager de " +
+        "bonus tegen een aanvalstype, hoe beter dat type werkt.",
+    );
+  }
+
+  return lines;
+};
+
+const formatMonster = (result: MonsterLookup): string => {
+  const first = result.versions[0]!;
+  const lines = [
+    `# ${first.name}`,
+    ...(result.cached ? ["", "_Uit cache, maximaal een uur oud._"] : []),
+  ];
+
+  if (result.versions.length > 1) {
+    lines.push(
+      "",
+      `De wiki kent ${result.versions.length} versies van dit monster (verschillende ` +
+        "locaties of quest-fases, vaak met eigen stats). De standaardversie staat bovenaan.",
+    );
+  }
+
+  for (const version of result.versions) {
+    lines.push(...formatMonsterVersion(version, result.versions.length > 1));
+  }
+
+  lines.push(
+    "",
+    `Drop table opvragen: get_drop_table met "${first.pageName}".`,
+    WIKI_NAME_NOTE,
+  );
+  return lines.join("\n");
+};
+
+server.registerTool(
+  "lookup_monster",
+  {
+    title: "OSRS-monster opzoeken",
+    description:
+      "Zoekt een monster op bij de OSRS Wiki: combat level, hitpoints, max hit, " +
+      "aanvals- en verdedigingsbonussen, slayer-eisen en de vermelde zwaktes. " +
+      "Heeft een monster meerdere versies (locaties, quest-fases), dan komen ze " +
+      "allemaal terug met de standaardversie bovenaan.",
+    inputSchema: {
+      name: z
+        .string()
+        .describe("De monsternaam zoals op de wiki, bijvoorbeeld 'Abyssal demon'."),
+    },
+  },
+  async ({ name }) => {
+    try {
+      return { content: [{ type: "text", text: formatMonster(await lookupMonster(name)) }] };
+    } catch (error: unknown) {
+      const message =
+        error instanceof WikiError
+          ? error.message
+          : `Onverwachte fout bij het opzoeken van het monster: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+      log(`lookup_monster mislukt voor "${name}": ${message}`);
+      return { content: [{ type: "text", text: message }], isError: true };
+    }
+  },
+);
+
+/** Kans als percentage met drie significante cijfers, zoals de wiki hem toont. */
+const asPercent = (chance: number): string => {
+  const percent = chance * 100;
+  const digits = percent >= 1 ? 2 : percent >= 0.01 ? 4 : 6;
+  return `${Number(percent.toFixed(digits))}%`;
+};
+
+const formatDropTable = (result: DropTable): string => {
+  const lines = [
+    `# Drop table — ${result.requestedName}`,
+    ...(result.cached ? ["", "_Uit cache, maximaal een uur oud._"] : []),
+    "",
+    `${result.lines.length} regel(s).`,
+    "",
+    "| Item | Aantal | Zeldzaamheid | Kans per kill | Type | Versie |",
+    "| --- | --- | --- | --- | --- | --- |",
+  ];
+
+  for (const line of result.lines) {
+    // Rolls > 1 betekent dat de breuk meerdere keren per kill gegooid wordt;
+    // de kans per kill is dan hoger dan de breuk alleen suggereert.
+    const rolls = line.rolls !== null && line.rolls > 1 ? `${line.rolls} × ` : "";
+    const rarity = line.rarity ? `${rolls}${line.approximate ? "~" : ""}${line.rarity}` : "—";
+    const chance =
+      line.chancePerKill === null
+        ? line.rarity && /^always$/i.test(line.rarity)
+          ? "100%"
+          : "—"
+        : asPercent(line.chancePerKill);
+    lines.push(
+      `| ${line.itemName} | ${line.quantity ?? "—"} | ${rarity} | ${chance} | ` +
+        `${line.dropType ?? "—"} | ${line.version ?? "—"} |`,
+    );
+  }
+
+  if (result.rareDropTableExcluded > 0) {
+    lines.push(
+      "",
+      `${result.rareDropTableExcluded} regel(s) komen via de rare drop table en staan ` +
+        "hier niet in. Zet include_rare_drop_table op true om ze mee te nemen.",
+    );
+  }
+
+  if (result.truncated) {
+    lines.push(
+      "",
+      "Let op: de lijst is afgekapt op 500 regels. Er kunnen drops ontbreken.",
+    );
+  }
+
+  lines.push(
+    "",
+    "De kans per kill is berekend uit de breuk van de wiki (met het aantal rolls " +
+      "erin verwerkt); een `~` betekent dat de wiki de kans zelf al als benadering " +
+      "markeert. Waar de zeldzaamheid een woord is (Varies, Random, Conditional) " +
+      "valt er geen getal van te maken.",
+    "Het type zegt waar de drop vandaan komt: `combat` is een kill, maar `reward`, " +
+      "`thieving` en dergelijke zijn andere bronnen die op dezelfde pagina staan.",
+    "Drop rates op de wiki zijn door spelers verzameld en soms een schatting.",
+  );
+  return lines.join("\n");
+};
+
+server.registerTool(
+  "get_drop_table",
+  {
+    title: "OSRS drop table opvragen",
+    description:
+      "Geeft de drop table van een monster met item, aantal, zeldzaamheid en de " +
+      "uitgerekende kans per kill, uit de gestructureerde wiki-data (niet uit " +
+      "geparseerde HTML). Regels via de rare drop table zitten er standaard niet " +
+      "in, net zoals de wiki zelf doet.",
+    inputSchema: {
+      monster: z
+        .string()
+        .describe(
+          "De naam van de wiki-pagina met de drop table, bijvoorbeeld 'Abyssal demon'. " +
+            "Gebruik de paginanaam zonder versie-achtervoegsel.",
+        ),
+      include_rare_drop_table: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Of de regels van de gedeelde rare drop table meekomen. Standaard false: " +
+            "die lijst is lang en hetzelfde voor veel monsters.",
+        ),
+    },
+  },
+  async ({ monster, include_rare_drop_table }) => {
+    try {
+      const result = await fetchDropTable(monster, include_rare_drop_table);
+      return { content: [{ type: "text", text: formatDropTable(result) }] };
+    } catch (error: unknown) {
+      const message =
+        error instanceof WikiError
+          ? error.message
+          : `Onverwachte fout bij het ophalen van de drop table: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+      log(`get_drop_table mislukt voor "${monster}": ${message}`);
       return { content: [{ type: "text", text: message }], isError: true };
     }
   },

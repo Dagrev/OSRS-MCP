@@ -5,6 +5,8 @@
  * regels is de enige identificatie van een skill.
  */
 
+import { USER_AGENT } from "./useragent.js";
+
 /**
  * Skillvolgorde van `index_lite.ws`, geverifieerd tegen de live API op
  * 2026-09-16. De index IS de identificatie — er staan geen namen in de
@@ -162,7 +164,7 @@ export async function fetchSkills(
   try {
     response = await fetch(url, {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      headers: { "User-Agent": "osrs-mcp/0.1.0 (persoonlijke MCP-server)" },
+      headers: { "User-Agent": USER_AGENT },
     });
   } catch (error: unknown) {
     // AbortSignal.timeout levert een TimeoutError op; al het andere is netwerk.
