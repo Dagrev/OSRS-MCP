@@ -48,10 +48,11 @@ De inspector opent in de browser. Onder **Tools** staat `ping`; die geeft
 
 ## Beschikbare tools
 
-| Tool         | Argumenten                     | Beschrijving                                         |
-| ------------ | ------------------------------ | ---------------------------------------------------- |
-| `ping`       | —                              | Bereikbaarheidstest; geeft de servertijd (ISO 8601). |
-| `get_skills` | `username`, `accountType`      | Level, XP en rank per skill uit de OSRS Hiscores.    |
+| Tool         | Argumenten                | Beschrijving                                              |
+| ------------ | ------------------------- | --------------------------------------------------------- |
+| `ping`       | —                         | Bereikbaarheidstest; geeft de servertijd (ISO 8601).       |
+| `get_skills` | `username`, `accountType` | Level, XP en rank per skill uit de OSRS Hiscores.          |
+| `get_quests` | `username`, `filter`      | Status per quest (niet gestart / bezig / afgerond) via WikiSync. |
 
 `accountType` is optioneel en is er een van `normal` (standaard), `ironman`,
 `hardcore_ironman`, `ultimate_ironman`, `group_ironman` of
@@ -84,5 +85,46 @@ skills komen altijd achteraan erbij (zo is Sailing op index 24 gekomen). Komt er
 een skill bij die de server nog niet kent, dan valt de parser daar niet over maar
 zet er een placeholdernaam neer plus een waarschuwing in de uitvoer.
 
-Meer bronnen (quests, wiki, lokale plugindata) volgen in ORS-006 en verder.
+### Questvoortgang (WikiSync)
+
+`get_quests` leest de publieke WikiSync-data van de OSRS Wiki. `filter` is
+optioneel en is er een van `all` (standaard), `not_finished`, `in_progress`,
+`not_started` of `finished`. De tellingen bovenaan de uitvoer gaan altijd over
+alle quests, ook als er gefilterd wordt.
+
+**Wat er aan RuneLite-kant nodig is**, anders is er niets op te halen:
+
+1. Open in RuneLite de **Plugin Hub** (configuratiescherm → puzzelstukje onderaan).
+2. Zoek op **WikiSync** en installeer die plugin.
+3. Zet hem aan en laat de questoptie aanstaan (standaard aan).
+4. **Log één keer in op het account op een gewone wereld.** De sync gebeurt bij
+   het inloggen, niet bij het opstarten van de client.
+
+Is er nooit gesynchroniseerd, dan geeft de tool een melding met precies deze
+stappen erin in plaats van een lege lijst.
+
+Drie dingen om te weten:
+
+- **Het is een momentopname, geen live data.** Je ziet de stand van de laatste
+  keer dat er met WikiSync aan is ingelogd.
+- **Hoe oud die momentopname is, valt niet te zien.** Het `timestamp`-veld in de
+  respons is het moment van het antwoord, niet van de sync — nagemeten: twee
+  opvragingen een seconde na elkaar geven twee verschillende, actuele tijden, en
+  er komt geen `Last-Modified`-header mee.
+- **Er is geen accounttype-parameter.** Het pad eindigt op een *wereldtype*, en
+  alleen `STANDARD` is opvraagbaar; `IRONMAN`, `GROUP_IRONMAN`, `DEADMAN` en
+  `LEAGUE` geven allemaal HTTP 400 "Cannot query data for this world type".
+  Ironmen en group-ironmen spelen op gewone werelden en zitten dus gewoon in
+  `STANDARD` — geverifieerd tegen een ironman-account.
+
+Naast de quests levert dezelfde respons achievement diaries, combat
+achievements, muzieknummers en levels. Die worden samengevat onderaan de uitvoer
+meegegeven omdat ze gratis meekomen; eigen tools ervoor zijn een apart ticket.
+
+Het endpoint is `https://sync.runescape.wiki/runelite/player/<naam>/STANDARD`.
+Dit is community-infrastructuur, geen officiële Jagex-API: het formaat kan
+wijzigen. `src/wikisync.ts` parst daarom defensief — onbekende questwaarden
+worden overgeslagen met een waarschuwing in de uitvoer in plaats van een crash.
+
+Meer bronnen (wiki, lokale plugindata) volgen in ORS-007 en verder.
 # OSRS-MCP
