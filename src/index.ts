@@ -579,13 +579,14 @@ const formatDropTable = (result: DropTable): string => {
     "",
     `${result.lines.length} regel(s).`,
     "",
-    "| Item | Aantal | Zeldzaamheid | Kans per kill | Type | Versie |",
+    "| Item | Aantal | Zeldzaamheid | Kans op ≥1 per kill | Type | Versie |",
     "| --- | --- | --- | --- | --- | --- |",
   ];
 
   for (const line of result.lines) {
-    // Rolls > 1 betekent dat de breuk meerdere keren per kill gegooid wordt;
-    // de kans per kill is dan hoger dan de breuk alleen suggereert.
+    // Rolls > 1 betekent dat de breuk meerdere keren per kill gegooid wordt.
+    // De zeldzaamheid blijft de breuk per roll, zoals de wiki hem noteert; de
+    // kans-kolom combineert ze tot de kans op minstens één exemplaar.
     const rolls = line.rolls !== null && line.rolls > 1 ? `${line.rolls} × ` : "";
     const rarity = line.rarity ? `${rolls}${line.approximate ? "~" : ""}${line.rarity}` : "—";
     const chance =
@@ -617,10 +618,12 @@ const formatDropTable = (result: DropTable): string => {
 
   lines.push(
     "",
-    "De kans per kill is berekend uit de breuk van de wiki (met het aantal rolls " +
-      "erin verwerkt); een `~` betekent dat de wiki de kans zelf al als benadering " +
-      "markeert. Waar de zeldzaamheid een woord is (Varies, Random, Conditional) " +
-      "valt er geen getal van te maken.",
+    "De zeldzaamheid is de breuk zoals de wiki hem noteert: bij `2 × 8/150` wordt " +
+      "die breuk twee keer per kill gegooid. De kans-kolom combineert dat tot de kans " +
+      "op minstens één exemplaar, `1 - (1 - breuk)^rolls` — dus iets lager dan " +
+      "breuk × rolls, want beide rolls kunnen ook raken. Een `~` betekent dat de wiki " +
+      "de kans zelf al als benadering markeert, en waar de zeldzaamheid een woord is " +
+      "(Varies, Random, Conditional) valt er geen getal van te maken.",
     "Het type zegt waar de drop vandaan komt: `combat` is een kill, maar `reward`, " +
       "`thieving` en dergelijke zijn andere bronnen die op dezelfde pagina staan.",
     "Drop rates op de wiki zijn door spelers verzameld en soms een schatting.",

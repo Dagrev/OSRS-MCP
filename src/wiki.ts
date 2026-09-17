@@ -751,9 +751,14 @@ export interface DropLine {
   /** De breuk als getal, zonder het aantal rolls erin. Null bij "Always"/"Varies". */
   chance: number | null;
   /**
-   * De kans dat de drop daadwerkelijk per kill valt: de breuk maal het aantal
-   * rolls, afgetopt op 1. Dit is het getal om op te sorteren en te tonen —
-   * `chance` alleen onderschat een drop met meerdere rolls.
+   * De kans op minstens één exemplaar per kill. Bij meerdere rolls is dat
+   * `1 - (1 - breuk)^rolls`, niet `breuk × rolls`: dat laatste is het
+   * verwachte aántal drops en loopt boven de 100% uit zodra de breuk groot is
+   * (twee rolls van 1/2 zou 100% geven in plaats van 75%).
+   *
+   * Dit is het getal om op te sorteren en te tonen. De wiki zelf combineert de
+   * rolls niet en schrijft "2 × 3,33%"; die per-roll-breuk blijft in `rarity`
+   * en `rolls` staan, zodat beide lezingen beschikbaar zijn.
    */
   chancePerKill: number | null;
   /** Aantal rolls; een drop met 2 rolls valt vaker dan de breuk suggereert. */
@@ -833,7 +838,11 @@ const readDropLine = (row: Record<string, unknown>): DropLine | null => {
     rarity,
     chance,
     chancePerKill:
-      chance === null ? null : Math.min(1, chance * (rolls !== null && rolls > 1 ? rolls : 1)),
+      chance === null
+        ? null
+        : rolls !== null && rolls > 1
+          ? 1 - Math.pow(1 - Math.min(1, chance), rolls)
+          : chance,
     rolls,
     approximate: data.Approx === true,
     quantity: asText(data["Drop Quantity"]),
