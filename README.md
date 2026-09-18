@@ -59,6 +59,7 @@ De inspector opent in de browser. Onder **Tools** staat `ping`; die geeft
 | `get_drop_table`  | `monster`, `include_rare_drop_table`   | Drop table met de uitgerekende kans per kill.                    |
 | `get_inventory`   | —                                      | Laatste inventory-snapshot van de RuneLite-plugin.               |
 | `get_bank`        | —                                      | Laatste bank-snapshot van de RuneLite-plugin.                    |
+| `check_materials` | `item`, `quantity`, `sources`, `username`, `accountType` | "Heb ik de materialen voor X?" — recept, bank/inventory en skills in één antwoord. |
 
 `accountType` is optioneel en is er een van `normal` (standaard), `ironman`,
 `hardcore_ironman`, `ultimate_ironman`, `group_ironman` of
@@ -174,6 +175,47 @@ ontbreekt" zijn expres verschillende meldingen.
 
 De bank wordt door de plugin alleen herschreven als je hem in-game opent; die
 snapshot is dus vaak dagen oud zonder dat er iets mis is.
+
+### Bronnen combineren (`check_materials`)
+
+`check_materials` beantwoordt "heb ik de materialen voor X?" door drie bronnen
+naast elkaar te leggen: het recept van de wiki, de bank- en
+inventory-snapshot van de plugin, en — als je `username` meegeeft — de
+skill-levels uit de hiscores.
+
+**De koppeling gaat op item-ID, niet op naam.** De plugin schrijft het ID op
+dat het spel gebruikt; de wiki zet dezelfde ID's in `infobox_item`. Namen
+lopen daar wél uit elkaar: van de 4.662 verhandelbare items in de spel-cache
+hebben er 296 een andere naam in het spel dan op de wiki (nagemeten
+2026-09-18), bijna altijd doordat het spel een achtervoegsel toevoegt dat de
+wiki op de paginanaam zet in plaats van op de itemnaam — `Annakarl teleport
+(tablet)` tegenover `Annakarl teleport`. Koppelen op naam zou daar op ruim
+zes procent van de items misgaan.
+
+Om dat op ID te kunnen doen wordt de hele item-tabel van de wiki één keer
+opgehaald en in het geheugen gehouden: ongeveer 16.000 ID's in vier requests,
+een dag geldig. Dat gebeurt lui — pas bij de eerste vraag die de index nodig
+heeft, niet bij het starten. Per item bevragen kan niet: Bucket accepteert
+maar één waarde per `where` en kent geen `orWhere`, dus een bank met
+vierhonderd soorten zou vierhonderd requests kosten.
+
+Drie dingen die de tool expliciet meldt in plaats van stilzwijgend af te
+handelen:
+
+- **Noted items.** De noted vorm heeft een eigen ID dat de wiki niet kent
+  (die documenteert alleen de gewone vorm). Is het ID onbekend maar hoort
+  `ID − 1` bij een item met exact dezelfde naam, dan is dit vrijwel zeker de
+  noted vorm. Dat staat er dan bij; de naamgelijkheid is de controle.
+- **Onkoppelbare regels.** Een ID dat de wiki niet kent en waarvan de naam
+  ook nergens op past, wordt bij naam genoemd in het antwoord. Weglaten zou
+  betekenen dat Claude met vertrouwen zegt dat je iets niet hebt.
+- **Onleesbare bronnen.** Is de bank niet te lezen, dan komt elk materiaal
+  dat niet gevonden is op *onbekend* te staan, niet op een tekort. Onzekerheid
+  is hier geen "nee".
+
+Gereedschap en faciliteiten (hamer, aambeeld, zaagmolen) worden genoemd maar
+niet tegen de bank gelegd: een aambeeld ligt niet in je bank en een hamer kan
+in je toolbelt zitten.
 
 ## Deployen op de homelab
 

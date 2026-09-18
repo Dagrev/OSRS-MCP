@@ -26,6 +26,7 @@ import {
   type ContainerData,
   type ContainerKind,
 } from "./plugindata.js";
+import { checkMaterials, type MaterialCheck, type MaterialsReport, type RecipeCheck } from "./materials.js";
 import {
   WikiError,
   fetchDropTable,
@@ -272,8 +273,9 @@ server.registerTool(
 
 /**
  * Elke wiki-naam die in de uitvoer komt, krijgt hetzelfde voorbehoud mee: de
- * wiki-naam kan afwijken van de in-game naam. Het koppelen van in-game data
- * aan wiki-pagina's is ORS-009; hier wordt het alleen gesignaleerd.
+ * wiki-naam kan afwijken van de in-game naam. Het daadwerkelijk koppelen van
+ * in-game data aan wiki-items gebeurt in `itemindex.ts` op item-ID
+ * (ORS-009); hier, waar alleen een naam is ingetypt, is dat niet mogelijk.
  */
 const WIKI_NAME_NOTE =
   "Namen op de wiki wijken soms af van de in-game itemnaam: varianten staan " +
@@ -839,6 +841,304 @@ server.registerTool(
     inputSchema: {},
   },
   async () => respondWithContainer("bank"),
+);
+
+/* ------------------------------------------------------------------ *
+ * Gecombineerde vraag — plugindata + wiki + hiscores
+ * ------------------------------------------------------------------ */
+
+/** Een statuswoord met een teken ervoor, zodat een lijst in één blik te lezen is. */
+const MATERIAL_MARK: Record<MaterialCheck["status"], string> = {
+  genoeg: "✅ genoeg",
+  "te weinig": "⚠️ te weinig",
+  niets: "❌ niets gevonden",
+  onbekend: "❔ onbekend",
+};
+
+const formatMaterialRow = (check: MaterialCheck): string => {
+  const needed =
+    check.neededRounded === null
+      ? "?"
+      : check.needed !== null && check.needed !== check.neededRounded
+        ? `${nl(check.neededRounded)} (gem. ${check.needed})`
+        : nl(check.neededRounded);
+  const where = [...new Set(check.matches.map((m) => m.holding.source))].join(" + ");
+  return (
+    `| ${check.material.name} | ${needed} | ${nl(check.have)} | ` +
+    `${MATERIAL_MARK[check.status]} | ${where || "—"} |`
+  );
+};
+
+const formatRecipeCheck = (check: RecipeCheck, quantity: number): string[] => {
+  const recipe = check.recipe;
+  const heading = [recipe.outputName, recipe.method ? `via ${recipe.method}` : null]
+    .filter((part) => part !== null)
+    .join(" — ");
+
+  const lines = [`## ${heading}`, ""];
+
+  if (recipe.outputQuantity !== null && recipe.outputQuantity !== 1) {
+    lines.push(`Eén keer maken levert ${recipe.outputQuantity} op.`);
+  }
+  lines.push(
+    `Nodig voor ${nl(quantity)} stuk(s): ${nl(check.batches)} keer uitvoeren.`,
+    "",
+    "| Materiaal | Nodig | Gevonden | Oordeel | Waar |",
+    "| --- | ---: | ---: | --- | --- |",
+  );
+  for (const material of check.materials) lines.push(formatMaterialRow(material));
+
+  if (recipe.skills.length > 0) {
+    lines.push("", "**Skill-eisen**");
+    for (const skill of check.skills) {
+      const actual =
+        skill.actual === null
+          ? "onbekend (geen account opgegeven of niet gerangschikt)"
+          : `level ${skill.actual}`;
+      const mark =
+        skill.status === "gehaald" ? "✅" : skill.status === "te laag" ? "❌" : "❔";
+      lines.push(
+        `- ${mark} ${skill.name} ${skill.required} — jij: ${actual}` +
+          (skill.status === "te laag" && skill.boostable === true
+            ? " (de wiki zegt dat deze te boosten is)"
+            : ""),
+      );
+    }
+    if (check.skills.length === 0) {
+      lines.push("- (de wiki noemt geen level bij deze skills)");
+    }
+  }
+
+  const facilities = [...recipe.facilities, ...recipe.tools];
+  if (facilities.length > 0) {
+    lines.push(
+      "",
+      `**Nodig maar niet geteld:** ${facilities.join(", ")}. Gereedschap en ` +
+        "faciliteiten worden niet tegen de bank gelegd — een aambeeld ligt niet " +
+        "in je bank, en een hamer kan in je toolbelt zitten.",
+    );
+  }
+
+  const notes = check.materials.flatMap((material) =>
+    material.notes.map((note) => `- ${material.material.name}: ${note}`),
+  );
+  if (notes.length > 0) lines.push("", "**Kanttekeningen bij de koppeling**", ...notes);
+
+  lines.push(
+    "",
+    check.uncertain
+      ? "**Materialen: niet met zekerheid te zeggen.** Zie de kanttekeningen " +
+        'hierboven; er ontbreekt iets in de waarneming, dus dit is geen "nee".'
+      : check.complete
+        ? "**Materialen: je hebt alles wat dit recept vraagt.**"
+        : "**Materialen: je komt tekort** (zie de regels hierboven).",
+  );
+
+  // De skill-eis staat bewust apart van het materiaaloordeel: een onbekend
+  // level maakt niet onzeker of het spul in je bank ligt.
+  const tooLow = check.skills.filter((skill) => skill.status === "te laag");
+  const unknown = check.skills.filter((skill) => skill.status === "onbekend");
+  if (tooLow.length > 0) {
+    lines.push(
+      `**Skills: nog niet.** ${tooLow
+        .map((skill) => `${skill.name} ${skill.required} (jij ${skill.actual})`)
+        .join(", ")}.`,
+    );
+  } else if (unknown.length > 0) {
+    lines.push(
+      `**Skills: niet getoetst** (${unknown.map((skill) => skill.name).join(", ")}).`,
+    );
+  } else if (check.skills.length > 0) {
+    lines.push("**Skills: je haalt de eisen.**");
+  }
+
+  return lines;
+};
+
+const formatMaterials = (report: MaterialsReport): string => {
+  // De gevraagde naam in de kop, niet de naam van het eerste recept: die twee
+  // verschillen zodra de wiki het resultaat anders noemt dan de pagina
+  // ("Super attack" levert "Super attack(3)" op), en dan lijkt het antwoord
+  // over iets anders te gaan dan er gevraagd is.
+  const lines = [`# Materialen voor ${nl(report.requestedQuantity)}× ${report.requestedItem}`, ""];
+  const producedName = report.lookup.recipes[0]?.outputName;
+  if (producedName && producedName.toLowerCase() !== report.requestedItem.toLowerCase()) {
+    lines.push(`De wiki noemt het resultaat "${producedName}".`, "");
+  }
+
+  if (report.lookup.resolvedVia) lines.push(report.lookup.resolvedVia, "");
+
+  const readable = report.sources.filter((source) => source.data !== null);
+  const failed = report.sources.filter((source) => source.data === null);
+
+  lines.push("**Bronnen**");
+  for (const source of readable) {
+    const data = source.data!;
+    lines.push(
+      `- ${CONTAINERS[source.kind].label}: ${data.items.length} regel(s), snapshot van ` +
+        `${data.timestamp}` +
+        (data.ageSeconds === null ? "" : ` (${formatAge(data.ageSeconds)} oud)`),
+    );
+  }
+  for (const source of failed) {
+    lines.push(`- ${CONTAINERS[source.kind].label}: **niet gelezen** — ${source.error}`);
+  }
+  lines.push(
+    `- wiki-item-index: ${nl(report.index.idCount)} item-ID's, opgebouwd op ` +
+      `${new Date(report.index.builtAt).toISOString()}`,
+  );
+  if (report.skills) {
+    lines.push(
+      `- hiscores: "${report.skills.username}" (${report.skills.accountType})` +
+        (report.skills.cached ? ", uit cache" : ""),
+    );
+  } else if (report.skillsError) {
+    lines.push(`- hiscores: **niet gelezen** — ${report.skillsError}`);
+  } else {
+    lines.push(
+      "- hiscores: niet opgevraagd. Geef `username` mee om ook de skill-eisen te toetsen.",
+    );
+  }
+
+  if (failed.length > 0) {
+    lines.push(
+      "",
+      "**Let op: niet alle gevraagde bronnen zijn gelezen.** Wat daar in ligt is " +
+        "onbekend, niet afwezig. Materialen die niet gevonden zijn, staan daarom op " +
+        '"onbekend" in plaats van op een tekort.',
+    );
+  }
+
+  lines.push("");
+
+  if (report.checks.length > 1) {
+    lines.push(
+      `De wiki kent ${report.checks.length} manieren om dit te maken. Ze staan er ` +
+        "allemaal; kies zelf welke past.",
+      "",
+    );
+  }
+
+  for (const check of report.checks) {
+    lines.push(...formatRecipeCheck(check, report.requestedQuantity), "");
+  }
+
+  const strong = report.holdings.length - report.unlinked.length - report.weakLinks.length;
+  lines.push("## Koppeling van item-ID's", "");
+  lines.push(
+    `${nl(report.holdings.length)} regel(s) gelezen: ${nl(strong)} gekoppeld op ` +
+      `item-ID, ${nl(report.weakLinks.length)} op een zwakkere aanwijzing, ` +
+      `${nl(report.unlinked.length)} helemaal niet.`,
+  );
+
+  if (report.weakLinks.length > 0) {
+    lines.push(
+      "",
+      `Niet op het ID zelf gekoppeld — weeg deze regels met meer voorbehoud:`,
+    );
+    for (const holding of report.weakLinks.slice(0, 15)) {
+      lines.push(`- ${holding.pluginName} (ID ${holding.id}, ${holding.source}): ${holding.note}`);
+    }
+    if (report.weakLinks.length > 15) {
+      lines.push(`- … en nog ${nl(report.weakLinks.length - 15)} regel(s).`);
+    }
+  }
+
+  if (report.unlinked.length > 0) {
+    lines.push(
+      "",
+      `**${nl(report.unlinked.length)} regel(s) zijn niet aan een wiki-item te ` +
+        "koppelen.** Ze worden hier genoemd en niet weggelaten: zit er een " +
+        "materiaal tussen dat je zocht, dan is het oordeel hierboven voor dat " +
+        "materiaal niet te vertrouwen.",
+    );
+    for (const holding of report.unlinked.slice(0, 25)) {
+      lines.push(`- ${holding.pluginName} (ID ${holding.id}, ${holding.source})`);
+    }
+    if (report.unlinked.length > 25) {
+      lines.push(`- … en nog ${nl(report.unlinked.length - 25)} regel(s).`);
+    }
+  } else if (report.holdings.length > 0) {
+    lines.push("", "Er bleef geen enkele regel onkoppelbaar.");
+  }
+
+  lines.push(
+    "",
+    "De bank- en inventorydata komt van de plugin op de spelmachine en is zo oud " +
+      "als de snapshot hierboven zegt. De recepten en item-ID's komen uit de " +
+      "gestructureerde wiki-data.",
+  );
+
+  return lines.join("\n");
+};
+
+server.registerTool(
+  "check_materials",
+  {
+    title: "Materialen controleren tegen bank en inventory",
+    description:
+      "Beantwoordt de vraag 'heb ik de materialen voor X?' door drie bronnen te " +
+      "combineren: het recept van de OSRS Wiki, de bank- en inventory-snapshot van " +
+      "de RuneLite-plugin, en — als je een account meegeeft — de skill-levels uit de " +
+      "hiscores. Items worden gekoppeld op item-ID, niet op naam. Wat niet te " +
+      "koppelen of niet te lezen is, komt als 'onbekend' terug en nooit als 'je " +
+      "hebt het niet'.",
+    inputSchema: {
+      item: z
+        .string()
+        .describe(
+          "Wat je wilt maken, zoals het in het spel of op de wiki heet — " +
+            "bijvoorbeeld 'Super attack(4)' of 'Steel platebody'.",
+        ),
+      quantity: z
+        .number()
+        .int()
+        .min(1)
+        .max(100_000)
+        .default(1)
+        .describe("Hoeveel je er wilt maken. Standaard 1."),
+      sources: z
+        .enum(["bank", "inventory", "both"])
+        .default("both")
+        .describe(
+          "Waar gekeken wordt. Standaard 'both': bank én inventory bij elkaar " +
+            "opgeteld, want materiaal kan op beide plekken liggen.",
+        ),
+      username: usernameSchema
+        .optional()
+        .describe(
+          "Optioneel. Geef je dit mee, dan worden ook de skill-eisen van het recept " +
+            "tegen de hiscores gelegd.",
+        ),
+      accountType: z
+        .enum(Object.keys(ACCOUNT_TYPES) as [AccountType, ...AccountType[]])
+        .default("normal")
+        .describe("Alleen van belang als je 'username' meegeeft; zie get_skills."),
+    },
+  },
+  async ({ item, quantity, sources, username, accountType }) => {
+    try {
+      const report = await checkMaterials({
+        item,
+        quantity,
+        sources,
+        username: username ?? null,
+        accountType,
+      });
+      return { content: [{ type: "text", text: formatMaterials(report) }] };
+    } catch (error: unknown) {
+      // Een fout hier gaat over het recept, de wiki of de index — niet over wat
+      // er in de bank ligt. De melding moet dat verschil overbrengen.
+      const message =
+        error instanceof WikiError
+          ? error.message
+          : `Onverwachte fout bij het controleren van de materialen: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+      log(`check_materials mislukt voor "${item}": ${message}`);
+      return { content: [{ type: "text", text: message }], isError: true };
+    }
+  },
 );
 
 async function main() {
