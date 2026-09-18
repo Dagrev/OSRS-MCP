@@ -279,3 +279,117 @@ sessie nooit af — elke 30 seconden zou dat een lek zijn. Zie de toelichting in
 
 De container verandert niets aan de lokale werkwijze: `npm start` (stdio) en
 `npm run inspect` doen het onveranderd.
+
+## Aansluiten op Claude
+
+De server draait op de homelab, dus een client verbindt met een **HTTP-URL op
+het LAN**, niet met een lokaal `node`-commando:
+
+```
+http://192.168.1.154:3000/mcp
+```
+
+Dat adres is machine-specifiek: het is het IP van LXC 108 en de poort uit
+`docker-compose.yml`. Draait de container ergens anders, dan is dat het enige
+dat verandert.
+
+**Alleen op het thuisnetwerk.** Plain HTTP, geen authenticatie, geen poort open
+naar buiten. De claude.ai-website en de mobiele app kunnen er dus niet bij — die
+draaien bij Anthropic en zien `192.168.1.154` niet. Onderweg werkt het ook niet
+zonder VPN naar huis.
+
+### Claude Code
+
+Claude Code kan zelf HTTP praten:
+
+```
+claude mcp add --scope user --transport http osrs-mcp http://192.168.1.154:3000/mcp
+```
+
+`--scope user` zet hem in `~/.claude.json` en maakt hem beschikbaar in elk
+project; `--scope project` zou hem in een `.mcp.json` in de repo zetten. Daarna:
+
+```
+claude mcp list
+```
+
+Dit moet `osrs-mcp: ... (HTTP) - ✔ Connected` geven. Er is geen herstart nodig.
+
+### Claude Desktop
+
+Claude Desktop start MCP-servers als lokaal proces en kan zelf geen HTTP-URL
+aan. `mcp-remote` overbrugt dat: dat is een stdio-server die het verkeer
+doorzet naar de URL. Zelfde constructie als de Obsidian-MCP.
+
+Het configuratiebestand staat per platform ergens anders:
+
+| Platform | Pad |
+| --- | --- |
+| Linux | `~/.config/Claude/claude_desktop_config.json` |
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+
+Voeg daar onder `mcpServers` toe:
+
+```json
+{
+  "mcpServers": {
+    "osrs-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://192.168.1.154:3000/mcp",
+        "--transport",
+        "http-only",
+        "--allow-http"
+      ]
+    }
+  }
+}
+```
+
+`--allow-http` is nodig omdat het geen HTTPS is, en `--transport http-only`
+houdt `mcp-remote` weg bij SSE — supergateway serveert alleen streamable HTTP.
+
+**Claude Desktop herstarten** na het opslaan; hij leest de config alleen bij het
+opstarten. Onder Linux en Windows is het venster sluiten niet genoeg als de app
+naar het systeemvak minimaliseert — afsluiten via het tray-icoon.
+
+Daarna staan de tools onder het gereedschapsicoon in het invoerveld. `ping` is
+de goedkoopste test: die geeft de servertijd van de container terug.
+
+### De RuneLite-kant
+
+Twee van de tools (`get_inventory`, `get_bank`) en een deel van
+`check_materials` leunen op de plugin
+["OSRS Item Check"](../OSRS%20item%20check). Die staat niet op de Plugin Hub en
+moet dus zelf draaien:
+
+1. Bouw de plugin en start RuneLite ermee (`./gradlew run` in de plugin-repo),
+   of zet de gebouwde jar in `~/.runelite/sideloaded-plugins/` en start
+   RuneLite met `--developer-mode`.
+2. Zet de plugin aan in het configuratiescherm.
+3. Zet in de plugin-instellingen de **uitvoermap** op het NAS-pad, niet op het
+   standaardpad. De server draait in de container en leest `/data`; alleen via
+   de NAS-share zien die twee dezelfde bestanden. Op het standaardpad
+   (`~/.runelite/osrs-item-check/`) schrijft de plugin naar de spelmachine en
+   ziet de server niets.
+4. Log in, en open één keer de bank — de bank-snapshot wordt alleen geschreven
+   als je hem in-game opent.
+
+Voor `get_quests` is daarnaast de WikiSync-plugin nodig, zie
+[Questvoortgang](#questvoortgang-wikisync).
+
+### Als het niet werkt
+
+| Symptoom | Waarschijnlijke oorzaak |
+| --- | --- |
+| Client meldt de server als niet verbonden / niet bereikbaar | Je zit niet op het thuisnetwerk. Van buitenaf is `192.168.1.154` onbereikbaar; er is geen poort doorgezet. |
+| Zelfde melding, maar je bent wel thuis | De container draait niet. `pct enter 108`, `cd /opt/osrs-mcp`, `docker compose ps` — moet "Up" en "healthy" zijn. |
+| Alle tools werken, maar `get_bank` en `get_inventory` zeggen "bron niet te vinden" of "mount waarschijnlijk niet aangehaakt" | De NAS-share is niet gemount in LXC 108, of niet in de container. De tools zeggen dit expres in plaats van een lege bank terug te geven. |
+| Bank en inventory bestaan wel, maar zijn van weken geleden | De plugin schrijft nog naar het oude lokale pad. Controleer de uitvoermap in de plugin-instellingen. |
+| Bestanden ontbreken terwijl de map wel gevuld is | De plugin staat uit, of RuneLite draait zonder de plugin. |
+| Bank is oud terwijl inventory actueel is | Geen storing: de bank wordt alleen bij het openen in-game herschreven. |
+| `curl` geeft "No valid session ID provided" | Verwacht. De gateway draait stateful; na `initialize` hoort de `mcp-session-id`-header mee. Echte clients doen dat, handmatige `curl` niet. |
+| Een tool die je verwacht ontbreekt in de lijst | De container draait een oudere versie. Uitrollen: `git pull` + `docker compose up -d --build` in LXC 108. |
