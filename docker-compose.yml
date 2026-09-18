@@ -5,11 +5,17 @@ services:
     restart: unless-stopped
     ports:
       - "3000:3000"
+    volumes:
+      # De snapshots van de RuneLite-plugin. De keten is: Windows schrijft via
+      # SMB naar de NAS, LXC 108 mount diezelfde dataset via NFS op
+      # /mnt/osrs-data, en die map hangt hier read-only onder /data. De
+      # container spreekt dus zelf geen NFS; hij ziet een gewone map.
+      # Read-only omdat de server alleen leest — schrijven is de plugin.
+      - /mnt/osrs-data:/data:ro
     environment:
-      # De map met de snapshots van de RuneLite-plugin. Het volume dat hier
-      # onder komt te hangen is ORS-012; tot die tijd bestaat /data niet en
-      # zeggen get_bank en get_inventory dat de bron onbereikbaar is — niet
-      # dat de bank leeg is.
+      # De map met de snapshots van de RuneLite-plugin (zie volumes). Hangt de
+      # NFS-mount niet, dan is /data leeg of afwezig en zeggen get_bank en
+      # get_inventory dat de bron onbereikbaar is — niet dat de bank leeg is.
       OSRS_MCP_DATA_DIR: /data
       # Hoe lang een sessie (en dus het serverproces erachter) blijft leven na
       # de laatste request. Zie de toelichting bij `--stateful` in de Dockerfile.
