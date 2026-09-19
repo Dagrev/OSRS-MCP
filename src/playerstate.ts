@@ -30,7 +30,7 @@ import {
 } from "./plugindata.js";
 import { describePlace, type PlaceDescription } from "./landmarks.js";
 
-/** De bestandsnaam die `ItemCheckConfig.playerStateFilePath()` standaard gebruikt. */
+/** De bestandsnaam die de plugin in zijn datamap gebruikt. */
 export const PLAYER_STATE_FILE = "player-state.json";
 
 /** De throttle van de plugin: korter dan dit kan het bestand niet verversen. */

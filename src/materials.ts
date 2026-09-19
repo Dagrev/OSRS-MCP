@@ -3,7 +3,8 @@
  *
  * Hier komen drie bronnen samen die niets van elkaar weten:
  *
- * - de **plugin** weet wat er in de bank en inventory ligt, in item-ID's;
+ * - de **plugin** weet wat er in de bank ligt, in de inventory zit en aan de
+ *   speler hangt, in item-ID's;
  * - de **wiki** weet wat X nodig heeft, in namen;
  * - de **hiscores** weten welk skill-level je hebt.
  *
@@ -40,7 +41,7 @@ import {
 } from "./itemindex.js";
 import { fetchRecipes, type Recipe, type RecipeLookup, type RecipeMaterial } from "./recipes.js";
 
-export type SourceSelection = "bank" | "inventory" | "both";
+export type SourceSelection = "bank" | "inventory" | "equipment" | "all";
 
 /** Eén container, gelezen of niet. Een mislukking is hier geen uitzondering. */
 export interface SourceStatus {
@@ -116,8 +117,14 @@ export interface MaterialsReport {
   skillsError: string | null;
 }
 
+/**
+ * "all" is de zinnige standaard en niet één container: materiaal kan in de bank liggen,
+ * in de inventory zitten of aan de speler hangen, en alleen die drie bij elkaar zijn
+ * "wat ik heb". Tot ORS-017 heette dit "both" en waren het er twee — een gedragen item
+ * telde toen als niet-bezit.
+ */
 const kindsFor = (selection: SourceSelection): ContainerKind[] =>
-  selection === "both" ? ["bank", "inventory"] : [selection];
+  selection === "all" ? ["bank", "inventory", "equipment"] : [selection];
 
 const readSources = async (selection: SourceSelection): Promise<SourceStatus[]> =>
   Promise.all(

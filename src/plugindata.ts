@@ -1,5 +1,5 @@
 /**
- * Lokale plugindata — bank en inventory uit de RuneLite-plugin.
+ * Lokale plugindata — bank, inventory en uitrusting uit de RuneLite-plugin.
  *
  * De plugin "OSRS Item Check" (repo `/home/damian/code/osrs/OSRS item check`)
  * schrijft bij elke containerwijziging een JSON-snapshot weg. Deze module leest
@@ -27,8 +27,23 @@ import { join } from "node:path";
  * zijn eigen module: `playerstate.ts`.
  */
 export const CONTAINERS = {
-  inventory: { file: "inventory.json", label: "inventory" },
-  bank: { file: "bank.json", label: "bank" },
+  inventory: {
+    file: "inventory.json",
+    label: "inventory",
+    firstWrite: "De inventory wordt bij de eerste wijziging na inloggen geschreven.",
+  },
+  bank: {
+    file: "bank.json",
+    label: "bank",
+    firstWrite: "De bank wordt pas geschreven als die in-game geopend is.",
+  },
+  equipment: {
+    file: "equipment.json",
+    label: "uitrusting",
+    firstWrite:
+      "De uitrusting wordt geschreven zodra het spel de container doorgeeft: bij " +
+      "het inloggen, en daarna bij elke wisseling.",
+  },
 } as const;
 
 export type ContainerKind = keyof typeof CONTAINERS;
@@ -253,9 +268,7 @@ export const readContainer = async (kind: ContainerKind): Promise<ContainerData>
         `heeft (${entries.slice(0, 5).join(", ")}). De map is dus bereikbaar; de ` +
         `plugin heeft de ${CONTAINERS[kind].label} alleen nog nooit ` +
         "weggeschreven. " +
-        (kind === "bank"
-          ? "De bank wordt pas geschreven als die in-game geopend is."
-          : "De inventory wordt bij de eerste wijziging na inloggen geschreven.") +
+        CONTAINERS[kind].firstWrite +
         " Dit betekent niet dat hij leeg is.",
     );
   }

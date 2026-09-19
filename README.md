@@ -59,8 +59,9 @@ De inspector opent in de browser. Onder **Tools** staat `ping`; die geeft
 | `get_drop_table`  | `monster`, `include_rare_drop_table`   | Drop table met de uitgerekende kans per kill.                    |
 | `get_inventory`   | —                                      | Laatste inventory-snapshot van de RuneLite-plugin.               |
 | `get_bank`        | —                                      | Laatste bank-snapshot van de RuneLite-plugin.                    |
+| `get_equipment`   | —                                      | Wat de speler draagt, uit dezelfde plugin.                       |
 | `get_player_state` | —                                     | Waar de speler staat en hoe hij ervoor staat, uit de RuneLite-plugin. |
-| `check_materials` | `item`, `quantity`, `sources`, `username`, `accountType` | "Heb ik de materialen voor X?" — recept, bank/inventory en skills in één antwoord. |
+| `check_materials` | `item`, `quantity`, `sources`, `username`, `accountType` | "Heb ik de materialen voor X?" — recept, bank/inventory/uitrusting en skills in één antwoord. |
 | `find_destination` | `query`, `limit`                   | Zoekt een plek op naam en geeft de coördinaten terug.            |
 | `set_destination` | `name` of `x`/`y`, `plane`             | Laat Shortest Path een pad naar die plek in de client tekenen.   |
 | `clear_destination` | —                                    | Haalt dat pad weer weg.                                          |
@@ -149,14 +150,20 @@ Dit is community-infrastructuur, geen officiële Jagex-API: het formaat kan
 wijzigen. `src/wikisync.ts` parst daarom defensief — onbekende questwaarden
 worden overgeslagen met een waarschuwing in de uitvoer in plaats van een crash.
 
-### Lokale plugindata (bank en inventory)
+### Lokale plugindata (bank, inventory en uitrusting)
 
-`get_inventory` en `get_bank` lezen de JSON-snapshots die de RuneLite-plugin
+`get_inventory`, `get_bank` en `get_equipment` lezen de JSON-snapshots die de RuneLite-plugin
 ["OSRS Item Check"](../OSRS%20item%20check) bij elke containerwijziging
 wegschrijft. Welke map dat is, bepaalt de environment-variabele
 `OSRS_MCP_DATA_DIR`; staat die niet, dan is het `~/.runelite/osrs-item-check/`
 — hetzelfde standaardpad als in de pluginconfig, zodat het zonder instellen
 werkt als de server op de spelmachine draait.
+
+`get_equipment` bestaat omdat wat je draagt in géén van de andere twee
+containers zit. Zonder die bron beantwoordde "heb ik dit?" zichzelf met "nee"
+zodra het antwoord een gedragen amulet of cape was — een lege uitkomst die
+eruitziet als een antwoord. Lege uitrustingsslots leveren geen regel op, net
+zomin als lege bankplaatsen dat doen.
 
 Het antwoord bevat altijd het tijdstempel uit de snapshot én de wijzigingstijd
 van het bestand, zodat te zien is hoe oud de data is. Is de snapshot ouder dan
@@ -540,14 +547,18 @@ moet dus zelf draaien:
    of zet de gebouwde jar in `~/.runelite/sideloaded-plugins/` en start
    RuneLite met `--developer-mode`.
 2. Zet de plugin aan in het configuratiescherm.
-3. Zet in de plugin-instellingen **alle zes de bestandspaden** op het NAS-pad,
-   niet op het standaardpad: inventory, bank, spelstaat
-   (`playerStateFilePath`), en voor de bestemmingen ook `commandFilePath`,
-   `commandAckFilePath` en `routeFilePath`. Het zijn losse instellingen, dus een
-   vergeten pad blijft stil naar de spelmachine schrijven. De server draait in
-   de container en leest `/data`; alleen via de NAS-share zien die twee dezelfde
-   bestanden. Let op: elk pad is een **bestandsnaam**, geen map — op een map
-   gezet krijgt de plugin `AccessDeniedException`.
+3. Zet in de plugin-instellingen **"Data directory"** op het NAS-pad, niet op
+   het standaardpad. Dat is één instelling voor alle zeven de bestanden
+   (`inventory.json`, `bank.json`, `equipment.json`, `player-state.json`,
+   `route.json`, `command.json`, `command-ack.json`); de bestandsnamen liggen
+   vast en zijn dezelfde die de server verwacht. De server draait in de
+   container en leest `/data`; alleen via de NAS-share zien die twee dezelfde
+   bestanden. Let op: dit is een **map**, geen bestandsnaam.
+
+   Tot ORS-017 was dit een apart pad per bestand. Kom je van een oudere versie,
+   dan zijn die oude instellingen niet meer in gebruik en moet deze map één keer
+   opnieuw gezet worden — anders valt de plugin terug op
+   `~/.runelite/osrs-item-check/` en schrijft hij stil naar de spelmachine.
 4. Log in, en open één keer de bank — de bank-snapshot wordt alleen geschreven
    als je hem in-game opent. De spelstaat komt bij de eerste tick na inloggen.
 
@@ -565,13 +576,14 @@ commands" in de plugin-instellingen zet het hele kanaal uit als je dat wilt.
 | Client meldt de server als niet verbonden / niet bereikbaar | Je zit niet op het thuisnetwerk. Van buitenaf is `192.168.1.154` onbereikbaar; er is geen poort doorgezet. |
 | Zelfde melding, maar je bent wel thuis | De container draait niet. `pct enter 108`, `cd /opt/osrs-mcp`, `docker compose ps` — moet "Up" en "healthy" zijn. |
 | Alle tools werken, maar `get_bank` en `get_inventory` zeggen "bron niet te vinden" of "mount waarschijnlijk niet aangehaakt" | De NAS-share is niet gemount in LXC 108, of niet in de container. De tools zeggen dit expres in plaats van een lege bank terug te geven. |
-| Bank en inventory bestaan wel, maar zijn van weken geleden | De plugin schrijft nog naar het oude lokale pad. Controleer de uitvoermap in de plugin-instellingen. |
+| Bank en inventory bestaan wel, maar zijn van weken geleden | De plugin schrijft nog naar het oude lokale pad. Controleer "Data directory" in de plugin-instellingen. |
 | Bestanden ontbreken terwijl de map wel gevuld is | De plugin staat uit, of RuneLite draait zonder de plugin. |
-| `player-state.json` ontbreekt terwijl `bank.json` er wel staat | Ofwel `playerStateFilePath` wijst niet naar deze map (het is een eigen instelling, zie stap 3), ofwel de jar achter de snelkoppeling is ouder dan de spelstaat en moet opnieuw gebouwd worden. |
+| `player-state.json` ontbreekt terwijl `bank.json` er wel staat | De jar achter de snelkoppeling is ouder dan de spelstaat en moet opnieuw gebouwd worden. (Vóór ORS-017 kon het ook een vergeten los pad zijn; er is nu nog maar één mapinstelling, dus dat kan niet meer.) |
 | `get_player_state` zegt "niet actueel" terwijl er wel gespeeld wordt | De hartslag komt niet door: de schrijfactie naar de share faalt (een lezer die het bestand vasthoudt kan de atomaire rename blokkeren) of de klok van de spelmachine loopt uit de pas. Herstelt normaal zelf bij de volgende schrijfactie. |
 | De plaatsaanduiding klopt niet met wat je in het spel ziet | Sta je in een instance (POH, Gauntlet, raid)? Dan is de coördinaat die van de gekopieerde sjabloontegel; de tool zegt dat er ook bij. |
 | Bank is oud terwijl inventory actueel is | Geen storing: de bank wordt alleen bij het openen in-game herschreven. |
-| `set_destination` zegt "geen antwoord van de plugin" | RuneLite draait niet, de plugin staat uit, "Accept destination commands" staat uit, of `commandFilePath` wijst niet naar dezelfde map als de server. Controleer met `get_player_state` of de client nog schrijft. |
+| `equipment.json` ontbreekt terwijl `inventory.json` er wel staat | De jar is van vóór ORS-017 en kent de uitrusting nog niet; bouw hem opnieuw. Draait de nieuwe jar wel, dan is er sinds het opstarten niets aan- of uitgetrokken — log opnieuw in en het bestand verschijnt. |
+| `set_destination` zegt "geen antwoord van de plugin" | RuneLite draait niet, de plugin staat uit, "Accept destination commands" staat uit, of "Data directory" wijst niet naar dezelfde map als de server. Controleer met `get_player_state` of de client nog schrijft. |
 | `set_destination` zegt dat de datamap niet beschrijfbaar is | Het `/data`-volume in `docker-compose.yml` staat nog op `:ro`, of de NFS-export op de NAS is read-only. Alleen deze twee tools raken dat; de leestools blijven werken. |
 | `set_destination` zegt dat Shortest Path niet geïnstalleerd is terwijl hij wel draait | Skretzo heeft de plugin hernoemd. De koppeling gaat op de descriptor-naam "Shortest Path"; die staat als constante in `ItemCheckPlugin`. |
 | `plan_route` zegt dat er nog geen route ligt | Er is sinds het opstarten geen bestemming via de server gezet, of Shortest Path rekent nog. |

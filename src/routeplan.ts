@@ -26,6 +26,14 @@ export interface ItemNeed {
   name: string | null;
   /** Hoeveel er in de gelezen bronnen ligt, of null als geen bron gelezen kon worden. */
   held: number | null;
+  /**
+   * Waar die exemplaren liggen. Leeg als je er geen hebt of als geen bron gelezen is.
+   *
+   * Het totaal alleen is niet genoeg om op te handelen: een teleporttablet in de bank
+   * moet je nog ophalen, hetzelfde tablet in je inventory kun je nu gebruiken, en een
+   * gedragen ring van dun is al aan. Dat verschil hoort in het antwoord te staan.
+   */
+  heldBySource: { kind: ContainerKind; quantity: number }[];
 }
 
 /** Eén manier om aan de eisen van een etappe te voldoen. */
@@ -86,20 +94,25 @@ const requirementsFor = (leg: RouteLeg): { key: string; found: readonly Transpor
  * ligt.
  */
 const readHoldings = async (): Promise<{
-  counts: Map<number, number> | null;
+  counts: Map<number, Map<ContainerKind, number>> | null;
   names: Map<number, string>;
   sources: RoutePlan["sources"];
 }> => {
-  const counts = new Map<number, number>();
+  const counts = new Map<number, Map<ContainerKind, number>>();
   const names = new Map<number, string>();
   const sources: RoutePlan["sources"] = [];
   let anyRead = false;
 
-  for (const kind of ["bank", "inventory"] as const) {
+  // De uitrusting staat hier sinds ORS-017 naast de andere twee. Zonder die bron kwam
+  // een gedragen teleportitem terug als "je hebt er 0" — een tekort dat er niet is, en
+  // precies het soort antwoord dat deze module elders juist vermijdt.
+  for (const kind of ["bank", "inventory", "equipment"] as const) {
     try {
       const container = await readContainer(kind);
       for (const item of container.items) {
-        counts.set(item.id, (counts.get(item.id) ?? 0) + item.quantity);
+        const perSource = counts.get(item.id) ?? new Map<ContainerKind, number>();
+        perSource.set(kind, (perSource.get(kind) ?? 0) + item.quantity);
+        counts.set(item.id, perSource);
         names.set(item.id, item.name);
       }
       anyRead = true;
@@ -122,15 +135,25 @@ const readHoldings = async (): Promise<{
 
 const toAlternative = (
   items: readonly (readonly [number, number])[],
-  counts: Map<number, number> | null,
+  counts: Map<number, Map<ContainerKind, number>> | null,
   names: Map<number, string>,
 ): NeedAlternative => {
-  const needs: ItemNeed[] = items.map(([id, quantity]) => ({
-    id,
-    quantity,
-    name: names.get(id) ?? null,
-    held: counts === null ? null : (counts.get(id) ?? 0),
-  }));
+  const needs: ItemNeed[] = items.map(([id, quantity]) => {
+    const perSource = counts === null ? null : (counts.get(id) ?? new Map<ContainerKind, number>());
+    return {
+      id,
+      quantity,
+      name: names.get(id) ?? null,
+      held:
+        perSource === null
+          ? null
+          : [...perSource.values()].reduce((total, amount) => total + amount, 0),
+      heldBySource:
+        perSource === null
+          ? []
+          : [...perSource.entries()].map(([kind, amount]) => ({ kind, quantity: amount })),
+    };
+  });
 
   const satisfied = needs.some((need) => need.held === null)
     ? null

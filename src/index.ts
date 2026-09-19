@@ -741,12 +741,43 @@ const aggregateItems = (data: ContainerData) => {
     .sort((a, b) => b.quantity - a.quantity || a.name.localeCompare(b.name, "nl"));
 };
 
+/**
+ * Kop en verouderingstekst per container.
+ *
+ * Wat "oud" betekent verschilt per bron, en dat is het hele punt van deze tabel. De
+ * inventory verandert continu tijdens het spelen, dus een oude snapshot betekent daar
+ * vrijwel zeker dat er niemand speelt. De bank en de uitrusting worden alleen bij een
+ * wijziging herschreven — uren oud is daar de normale toestand, en het als verdacht
+ * presenteren zou de gebruiker laten twijfelen aan data die gewoon klopt.
+ */
+const CONTAINER_PRESENTATION: Record<ContainerKind, { heading: string; staleNote: string }> = {
+  inventory: {
+    heading: "Inventory",
+    staleNote:
+      "De inventory verandert tijdens het spelen continu, dus dit is vrijwel zeker " +
+      "niet de huidige stand. Waarschijnlijk is de client afgesloten of de plugin uit.",
+  },
+  bank: {
+    heading: "Bank",
+    staleNote:
+      "Voor de bank is dat normaal — die wordt alleen herschreven als de bank in-game " +
+      "geopend wordt. Behandel het als de laatst bekende stand, niet als de huidige.",
+  },
+  equipment: {
+    heading: "Uitrusting",
+    staleNote:
+      "Voor de uitrusting is dat normaal — die wordt alleen herschreven als er iets " +
+      "aan- of uitgaat, en wie uren in dezelfde set speelt verandert er niets aan. " +
+      "Behandel het als de laatst bekende stand.",
+  },
+};
+
 const formatContainer = (data: ContainerData): string => {
   const rows = aggregateItems(data);
   const label = CONTAINERS[data.kind].label;
 
   const lines = [
-    `# ${data.kind === "bank" ? "Bank" : "Inventory"} volgens de RuneLite-plugin`,
+    `# ${CONTAINER_PRESENTATION[data.kind].heading} volgens de RuneLite-plugin`,
     "",
     `- Tijdstempel uit de snapshot: ${data.timestamp}` +
       (data.ageSeconds === null
@@ -759,13 +790,7 @@ const formatContainer = (data: ContainerData): string => {
   if (data.ageSeconds !== null && data.ageSeconds > STALE_AFTER_SECONDS) {
     lines.push(
       `- **Let op: deze snapshot is ${formatAge(data.ageSeconds)} oud.** ` +
-        (data.kind === "bank"
-          ? "Voor de bank is dat normaal — die wordt alleen herschreven als de " +
-            "bank in-game geopend wordt. Behandel het als de laatst bekende " +
-            "stand, niet als de huidige."
-          : "De inventory verandert tijdens het spelen continu, dus dit is " +
-            "vrijwel zeker niet de huidige stand. Waarschijnlijk is de client " +
-            "afgesloten of de plugin uit."),
+        CONTAINER_PRESENTATION[data.kind].staleNote,
     );
   }
 
@@ -833,14 +858,23 @@ const respondWithContainer = async (kind: ContainerKind) => {
 };
 
 /** Dezelfde toelichting voor beide tools; alleen de container verschilt. */
+const CONTAINER_TOOL_NOTE: Record<ContainerKind, string> = {
+  inventory: "De inventory wordt bij elke wijziging herschreven. ",
+  bank:
+    "De bank wordt alleen herschreven als die in-game geopend is, dus dit is de " +
+    "stand van de laatste keer bankieren. ",
+  equipment:
+    "Dit is wat de speler draagt: wapen, schild, helm, amulet, cape, ringen en de " +
+    "rest. Die items zitten in géén van beide andere containers, dus wie alleen " +
+    "get_bank en get_inventory raadpleegt mist wat er aan het lijf hangt. Lege " +
+    "uitrustingsslots leveren geen regel op. ",
+};
+
 const containerToolDescription = (kind: ContainerKind) =>
   `Leest de laatste ${CONTAINERS[kind].label}-snapshot die de RuneLite-plugin "OSRS ` +
   `Item Check" heeft weggeschreven, met het tijdstempel erbij zodat te zien is hoe ` +
   `oud de data is. ` +
-  (kind === "bank"
-    ? "De bank wordt alleen herschreven als die in-game geopend is, dus dit is de " +
-      "stand van de laatste keer bankieren. "
-    : "De inventory wordt bij elke wijziging herschreven. ") +
+  CONTAINER_TOOL_NOTE[kind] +
   `Is de bron niet te lezen, dan komt er een foutmelding — nooit een lege lijst. ` +
   `De datamap is in te stellen met de environment-variabele ${DATA_DIR_ENV} ` +
   `(nu: ${dataDir()}).`;
@@ -863,6 +897,16 @@ server.registerTool(
     inputSchema: {},
   },
   async () => respondWithContainer("bank"),
+);
+
+server.registerTool(
+  "get_equipment",
+  {
+    title: "OSRS uitrusting ophalen",
+    description: containerToolDescription("equipment"),
+    inputSchema: {},
+  },
+  async () => respondWithContainer("equipment"),
 );
 
 /* ------------------------------------------------------------------ *
@@ -1250,9 +1294,9 @@ const formatMaterials = (report: MaterialsReport): string => {
 
   lines.push(
     "",
-    "De bank- en inventorydata komt van de plugin op de spelmachine en is zo oud " +
-      "als de snapshot hierboven zegt. De recepten en item-ID's komen uit de " +
-      "gestructureerde wiki-data.",
+    "De bank-, inventory- en uitrustingsdata komt van de plugin op de spelmachine " +
+      "en is zo oud als de snapshot hierboven zegt. De recepten en item-ID's komen " +
+      "uit de gestructureerde wiki-data.",
   );
 
   return lines.join("\n");
@@ -1261,11 +1305,11 @@ const formatMaterials = (report: MaterialsReport): string => {
 server.registerTool(
   "check_materials",
   {
-    title: "Materialen controleren tegen bank en inventory",
+    title: "Materialen controleren tegen bank, inventory en uitrusting",
     description:
       "Beantwoordt de vraag 'heb ik de materialen voor X?' door drie bronnen te " +
-      "combineren: het recept van de OSRS Wiki, de bank- en inventory-snapshot van " +
-      "de RuneLite-plugin, en — als je een account meegeeft — de skill-levels uit de " +
+      "combineren: het recept van de OSRS Wiki, de bank-, inventory- en " +
+      "uitrustingssnapshot van de RuneLite-plugin, en — als je een account meegeeft — de skill-levels uit de " +
       "hiscores. Items worden gekoppeld op item-ID, niet op naam. Wat niet te " +
       "koppelen of niet te lezen is, komt als 'onbekend' terug en nooit als 'je " +
       "hebt het niet'.",
@@ -1284,11 +1328,12 @@ server.registerTool(
         .default(1)
         .describe("Hoeveel je er wilt maken. Standaard 1."),
       sources: z
-        .enum(["bank", "inventory", "both"])
-        .default("both")
+        .enum(["bank", "inventory", "equipment", "all"])
+        .default("all")
         .describe(
-          "Waar gekeken wordt. Standaard 'both': bank én inventory bij elkaar " +
-            "opgeteld, want materiaal kan op beide plekken liggen.",
+          "Waar gekeken wordt. Standaard 'all': bank, inventory én de gedragen " +
+            "uitrusting bij elkaar opgeteld. Een gedragen item is bezit, ook al zit " +
+            "het in geen van beide andere containers.",
         ),
       username: usernameSchema
         .optional()
@@ -1679,10 +1724,18 @@ const formatNeed = (need: ItemNeed): string => {
   const label = need.name === null ? `item-ID ${need.id}` : `${need.name} (ID ${need.id})`;
   const amount = need.quantity === 1 ? "" : ` ×${nl(need.quantity)}`;
   if (need.held === null) return `${label}${amount} — **bezit onbekend**`;
+  // Wáár het ligt bepaalt of je het nu kunt gebruiken: in de bank betekent eerst langs
+  // de bank, in de inventory betekent meteen, gedragen betekent dat het al aan is.
+  const where =
+    need.heldBySource.length === 0
+      ? ""
+      : ` (${need.heldBySource
+          .map((source) => `${nl(source.quantity)} in de ${CONTAINERS[source.kind].label}`)
+          .join(", ")})`;
   if (need.held >= need.quantity) {
-    return `${label}${amount} — je hebt er ${nl(need.held)}`;
+    return `${label}${amount} — je hebt er ${nl(need.held)}${where}`;
   }
-  return `${label}${amount} — **je hebt er ${nl(need.held)}**`;
+  return `${label}${amount} — **je hebt er ${nl(need.held)}**${where}`;
 };
 
 const formatPlannedLeg = (planned: PlannedLeg, position: number): string => {
@@ -1759,8 +1812,9 @@ server.registerTool(
       "Leest de route die Shortest Path heeft berekend voor de bestemming die met " +
       "set_destination is gezet, en beschrijft de etappes: welke boten, teleports, " +
       "fairy rings en shortcuts erin zitten, en welke items, quests en levels die " +
-      "vragen. Items worden op item-ID tegen de bank en de inventory gelegd, dus je " +
-      "ziet meteen wat je al hebt liggen. **Verandert niets in de client** — zet eerst " +
+      "vragen. Items worden op item-ID tegen de bank, de inventory en de gedragen " +
+      "uitrusting gelegd, met de bron erbij, dus je ziet niet alleen wat je hebt maar " +
+      "ook of je er nog voor langs de bank moet. **Verandert niets in de client** — zet eerst " +
       "een bestemming met set_destination. De route komt uit de plugin zelf, dus hij is " +
       "altijd dezelfde als de lijn die op de kaart staat.",
     inputSchema: {},
