@@ -300,7 +300,13 @@ aankondigingstekst van het transport. `plan_route` legt ze vervolgens op item-ID
 tegen de bank en de inventory, net als `check_materials` — dus je ziet meteen
 welke teleport je al hebt liggen.
 
-Twee beperkingen om te kennen:
+Drie beperkingen om te kennen:
+
+- **Een lege lijst transports is dubbelzinnig.** Shortest Path post hetzelfde
+  bericht of de route nu volledig te belopen is óf helemaal niet gevonden is.
+  Live gemeten: een pad van Lumbridge naar Karamja, met zee ertussen, kwam
+  terug met nul transports. De kaart in de client weet het verschil, deze
+  server niet.
 
 - **Runes voor teleportspreuken staan niet in de brondata.** Bij "Varrock
   Teleport" komt "25 Magic" terug en geen runekosten; die zijn dus ook niet

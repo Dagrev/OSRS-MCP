@@ -1602,10 +1602,16 @@ server.registerTool(
           "route naar dit punt, dan meldt de client dat zelf op de kaart.",
       );
     } else if (route.legs.length === 0) {
+      // Geen etappes betekent niet per se "te voet te doen". Shortest Path post ook een
+      // lege lijst als hij helemaal geen route vond — live gemeten op 2026-09-19: een
+      // pad naar Karamja, met zee ertussen, kwam terug met nul transports. Welke van de
+      // twee het is, staat niet in het bericht; alleen de kaart in de client weet het.
       lines.push(
         "",
-        "De route is berekend en loopt volledig te voet: er zit geen boot, teleport of " +
-          "shortcut in. `plan_route` heeft dan weinig toe te voegen.",
+        "Shortest Path meldt geen transports in deze route. Dat betekent óf dat hij " +
+          "volledig te belopen is, óf dat er helemaal geen route gevonden is — die twee " +
+          "zijn hier niet uit elkaar te houden. **Kijk op de kaart in de client**: staat " +
+          "daar een lijn, dan is het het eerste.",
       );
     } else {
       lines.push(
@@ -1825,8 +1831,11 @@ server.registerTool(
     if (plan.legs.length === 0) {
       lines.push(
         "",
-        "De route bevat geen transports: hij is volledig te voet. Loop de lijn op de " +
-          "kaart na; er is onderweg niets nodig.",
+        "Er staan geen transports in deze route. Dat betekent óf dat hij volledig te " +
+          "belopen is en er onderweg niets nodig is, óf dat Shortest Path geen route " +
+          "naar dat punt kon vinden — het bericht dat hij terugstuurt is in beide " +
+          "gevallen leeg. **Kijk op de kaart in de client** welke van de twee het is: " +
+          "staat er een lijn getekend, dan is er een route.",
       );
       return { content: [{ type: "text", text: lines.join("\n") }] };
     }
