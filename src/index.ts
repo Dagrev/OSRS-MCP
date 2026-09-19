@@ -35,7 +35,19 @@ import {
   readPlayerState,
   type PlayerState,
 } from "./playerstate.js";
-import { LANDMARK_MAX_TILES } from "./landmarks.js";
+import {
+  LANDMARK_MAX_TILES,
+  searchLandmarks,
+  type DestinationCandidate,
+} from "./landmarks.js";
+import {
+  CommandChannelError,
+  ROUTE_TIMEOUT_MS,
+  sendCommand,
+  waitForRoute,
+  type CommandResult,
+} from "./destination.js";
+import { planRoute, type ItemNeed, type PlannedLeg, type RoutePlan } from "./routeplan.js";
 import { checkMaterials, type MaterialCheck, type MaterialsReport, type RecipeCheck } from "./materials.js";
 import {
   WikiError,
@@ -1312,6 +1324,526 @@ server.registerTool(
       log(`check_materials mislukt voor "${item}": ${message}`);
       return { content: [{ type: "text", text: message }], isError: true };
     }
+  },
+);
+
+/* ------------------------------------------------------------------ *
+ * Bestemmingen — zoeken, zetten, wissen en de route voorlezen
+ * ------------------------------------------------------------------ */
+
+/**
+ * Deze vier tools zijn de enige in deze server die niet puur lezen. Wat ze kunnen is
+ * precies één ding: Shortest Path een lijn op de kaart laten tekenen. Er is geen tool,
+ * en in de plugin geen codepad, dat een menu-actie zet, klikt of de speler verplaatst.
+ * Lopen doet de eigenaar zelf; dit wijst alleen de weg.
+ */
+
+/** Hoe een soort punt in een zin heet. Zelfde woorden als in `landmarks.ts`. */
+const CANDIDATE_PHRASE: Record<string, string> = {
+  bank: "bank",
+  altaar: "altaar",
+  teleport: "teleportbestemming",
+};
+
+const formatCandidate = (candidate: DestinationCandidate, state: PlayerState | null): string => {
+  const soort = CANDIDATE_PHRASE[candidate.category] ?? candidate.category;
+  // De gebiedshint hoort bij de naam en niet achteraan: "Varrock (bank, westelijk)" is
+  // wat de lezer moet onthouden om de west- van de oostbank te onderscheiden.
+  const hint = candidate.areaHint === null ? "" : `, ${candidate.areaHint}`;
+  const parts = [
+    `**${candidate.name}** (${soort}${hint}) — ${candidate.x}, ${candidate.y}` +
+      (candidate.plane === 0 ? "" : `, verdieping ${candidate.plane}`),
+  ];
+
+  if (state !== null) {
+    const tiles = Math.round(Math.hypot(candidate.x - state.x, candidate.y - state.y));
+    parts.push(`${nl(tiles)} tiles hiervandaan (hemelsbreed)`);
+  }
+  if (candidate.tileCount > 1) {
+    parts.push(`${nl(candidate.tileCount)} tegels onder deze naam; dit is de middelste`);
+  }
+
+  return `- ${parts.join(" · ")}`;
+};
+
+/** De spelstaat als die te lezen is, anders null. Nooit een reden om te falen. */
+const playerStateOrNull = async (): Promise<PlayerState | null> => {
+  try {
+    return await readPlayerState();
+  } catch {
+    return null;
+  }
+};
+
+/** Eén foutafhandeling voor alles wat in het kanaal mis kan gaan. */
+const destinationError = (error: unknown, what: string): string => {
+  if (error instanceof CommandChannelError || error instanceof PluginDataError) {
+    return error.message;
+  }
+  return `Onverwachte fout bij ${what}: ${
+    error instanceof Error ? error.message : String(error)
+  }`;
+};
+
+server.registerTool(
+  "find_destination",
+  {
+    title: "Een bestemming opzoeken op naam",
+    description:
+      "Zoekt een plek op een gewone naam — 'varrock bank', 'edgeville', 'altaar " +
+      "Lumbridge' — en geeft de coördinaten terug die set_destination nodig heeft. De " +
+      "tabel komt uit Shortest Path en kent banken, altaren en teleportbestemmingen; " +
+      "een willekeurige boom of een dungeon-ingang staat er niet in. Verandert niets in " +
+      "het spel. Staat de gezochte plek er niet bij, geef dan de coördinaat rechtstreeks " +
+      "aan set_destination.",
+    inputSchema: {
+      query: z
+        .string()
+        .trim()
+        .min(1, "Geef een naam om op te zoeken.")
+        .describe(
+          "De naam van de plek, zoals een speler hem zou noemen. Meerdere woorden " +
+            "werken als 'en': 'varrock bank' geeft alleen banken in Varrock.",
+        ),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(25)
+        .default(10)
+        .describe("Hoeveel kandidaten er hoogstens terugkomen. Standaard 10."),
+    },
+  },
+  async ({ query, limit }) => {
+    const candidates = searchLandmarks(query, limit);
+    if (candidates.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Geen enkel bekend punt past op "${query}". De tabel kent alleen banken, ` +
+              "altaren en teleportbestemmingen uit Shortest Path — geen willekeurige " +
+              "gebouwen, NPC's of dungeon-ingangen. Probeer een kortere zoekterm (alleen " +
+              "de plaatsnaam), of zoek de coördinaat op de wereldkaart op en geef die " +
+              "rechtstreeks aan set_destination.",
+          },
+        ],
+      };
+    }
+
+    const state = await playerStateOrNull();
+    const lines = [
+      `# Kandidaten voor "${query}"`,
+      "",
+      `${nl(candidates.length)} punt(en) gevonden.` +
+        (state === null
+          ? " De spelstaat is niet te lezen, dus de afstanden ontbreken."
+          : ` Afstanden zijn gemeten vanaf ${state.x}, ${state.y}.`),
+      "",
+      ...candidates.map((candidate) => formatCandidate(candidate, state)),
+      "",
+      "Geef de naam of de coördinaat van de juiste aan `set_destination`.",
+    ];
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  },
+);
+
+server.registerTool(
+  "set_destination",
+  {
+    title: "Een bestemming in de client laten tekenen",
+    description:
+      "Laat de Shortest Path-plugin een pad naar een bestemming op de wereldkaart en in " +
+      "de client tekenen. **Dit zet alleen een markering: er wordt niets aangeklikt en " +
+      "de speler beweegt niet.** Geef óf een naam (die wordt met dezelfde zoekactie als " +
+      "find_destination opgezocht), óf een coördinaat. Het startpunt is standaard waar " +
+      "de speler nu staat. Er wordt gewacht op bevestiging van de plugin, dus staat " +
+      "Shortest Path uit of draait de client niet, dan komt dat als fout terug en niet " +
+      "als een geslaagde opdracht. Vraag daarna plan_route voor de route in tekst.",
+    inputSchema: {
+      name: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "De plek op naam, zoals 'varrock bank'. Past er meer dan één punt even goed, " +
+            "dan wordt er niets gezet en krijg je de kandidaten terug om uit te kiezen. " +
+            "Geef je ook `x` en `y`, dan gelden die en dient de naam alleen als label.",
+        ),
+      x: z.number().int().optional().describe("X-coördinaat, als je geen naam geeft."),
+      y: z.number().int().optional().describe("Y-coördinaat, als je geen naam geeft."),
+      plane: z
+        .number()
+        .int()
+        .min(0)
+        .max(3)
+        .default(0)
+        .describe("Verdieping van de bestemming. 0 is de begane grond."),
+    },
+  },
+  async ({ name, x, y, plane }) => {
+    const hasCoordinates = x !== undefined && y !== undefined;
+    if (name === undefined && !hasCoordinates) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Geef een bestemming: óf `name` (een plek op naam), óf `x` en `y`. Zonder " +
+              "een van beide is er niets om naartoe te tekenen.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    let target: { x: number; y: number; plane: number };
+    let chosen: DestinationCandidate | null = null;
+
+    // Coördinaten winnen van een naam. Dat is niet willekeurig: als er meerdere punten
+    // op een naam passen, vraagt deze tool om de coördinaat van de juiste erbij te geven
+    // — en dan moet die coördinaat ook echt de doorslag geven. Anders is het antwoord op
+    // de vraag niet op te volgen.
+    if (hasCoordinates) {
+      target = { x: x!, y: y!, plane };
+    } else {
+      // De controle hierboven heeft al afgedwongen dat er dan een naam is.
+      const candidates = searchLandmarks(name!, 10);
+      if (candidates.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Geen bekend punt past op "${name!}", dus er is niets gezet. Zoek met ` +
+                "find_destination naar een andere schrijfwijze, of geef `x` en `y` " +
+                "rechtstreeks.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Gelijkspel niet zelf beslechten. Twee even goede kandidaten betekent dat de
+      // zoekterm niet zegt welke bedoeld wordt, en een gok zou hier een pad naar de
+      // verkeerde kant van de kaart opleveren zonder dat dat opvalt.
+      if (candidates.length > 1 && candidates[0]!.score === candidates[1]!.score) {
+        const state = await playerStateOrNull();
+        const tied = candidates.filter((candidate) => candidate.score === candidates[0]!.score);
+        return {
+          content: [
+            {
+              type: "text",
+              text: [
+                `"${name!}" past even goed op ${nl(tied.length)} punten. Er is niets ` +
+                  "gezet — roep deze tool opnieuw aan met de `x` en `y` van de juiste.",
+                "",
+                ...tied.map((candidate) => formatCandidate(candidate, state)),
+              ].join("\n"),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      chosen = candidates[0]!;
+      target = { x: chosen.x, y: chosen.y, plane: chosen.plane };
+    }
+
+    let result: CommandResult;
+    try {
+      result = await sendCommand("path", target, null);
+    } catch (error: unknown) {
+      return {
+        content: [{ type: "text", text: destinationError(error, "het zetten van de bestemming") }],
+        isError: true,
+      };
+    }
+
+    if (result.status !== "ok") {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `**De bestemming is niet gezet.** ${result.message}\n\nEr is dus niets ` +
+              "veranderd in de client; ga er niet van uit dat er een pad op de kaart staat.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const lines = [
+      "# Bestemming gezet",
+      "",
+      chosen === null
+        ? `- Doel: ${target.x}, ${target.y} (verdieping ${target.plane})`
+        : `- Doel: **${chosen.name}** (${CANDIDATE_PHRASE[chosen.category] ?? chosen.category}` +
+          `${chosen.areaHint === null ? "" : `, ${chosen.areaHint}`}) ` +
+          `op ${target.x}, ${target.y}` +
+          (target.plane === 0 ? "" : `, verdieping ${target.plane}`),
+      `- ${result.message}`,
+      `- Bevestigd door de plugin na ${(result.waitedMs / 1000).toFixed(1)} seconden.`,
+    ];
+
+    // De ack zegt dat het bericht aankwam; de route zegt dat er ook echt een pad uit
+    // kwam. Dat tweede is het bewijs dat er iets te zien is op de kaart.
+    const route = await waitForRoute(result.seq);
+    if (route === null) {
+      lines.push(
+        "",
+        "Shortest Path heeft nog geen route teruggemeld binnen " +
+          `${Math.round(ROUTE_TIMEOUT_MS / 1000)} seconden. Het pad wordt waarschijnlijk ` +
+          "nog berekend — vraag zo `plan_route` voor de route in tekst. Bestaat er geen " +
+          "route naar dit punt, dan meldt de client dat zelf op de kaart.",
+      );
+    } else if (route.legs.length === 0) {
+      lines.push(
+        "",
+        "De route is berekend en loopt volledig te voet: er zit geen boot, teleport of " +
+          "shortcut in. `plan_route` heeft dan weinig toe te voegen.",
+      );
+    } else {
+      lines.push(
+        "",
+        `De route is berekend en gebruikt ${nl(route.legs.length)} transport(en). Vraag ` +
+          "`plan_route` voor de etappes en wat je ervoor nodig hebt.",
+      );
+    }
+
+    lines.push(
+      "",
+      "Het pad staat getekend; er is niet geklikt en er is niemand verplaatst. Lopen doe " +
+        "je zelf.",
+    );
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  },
+);
+
+server.registerTool(
+  "clear_destination",
+  {
+    title: "De getekende bestemming weghalen",
+    description:
+      "Wist het pad dat set_destination in de client heeft laten tekenen. Verandert " +
+      "verder niets. Net als bij set_destination wordt er op bevestiging van de plugin " +
+      "gewacht, dus 'gewist' betekent hier ook echt gewist.",
+    inputSchema: {},
+  },
+  async () => {
+    let result: CommandResult;
+    try {
+      result = await sendCommand("clear", null, null);
+    } catch (error: unknown) {
+      return {
+        content: [{ type: "text", text: destinationError(error, "het wissen van de bestemming") }],
+        isError: true,
+      };
+    }
+
+    if (result.status !== "ok") {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `**Er is niets gewist.** ${result.message}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${result.message} Bevestigd door de plugin na ${(result.waitedMs / 1000).toFixed(1)} seconden.`,
+        },
+      ],
+    };
+  },
+);
+
+const formatNeed = (need: ItemNeed): string => {
+  const label = need.name === null ? `item-ID ${need.id}` : `${need.name} (ID ${need.id})`;
+  const amount = need.quantity === 1 ? "" : ` ×${nl(need.quantity)}`;
+  if (need.held === null) return `${label}${amount} — **bezit onbekend**`;
+  if (need.held >= need.quantity) {
+    return `${label}${amount} — je hebt er ${nl(need.held)}`;
+  }
+  return `${label}${amount} — **je hebt er ${nl(need.held)}**`;
+};
+
+const formatPlannedLeg = (planned: PlannedLeg, position: number): string => {
+  const { leg } = planned;
+  const naam = leg.displayInfo ?? leg.objectInfo ?? "naamloos transport";
+  const lines = [
+    `### ${position}. ${naam}`,
+    "",
+    `- Instappen op ${leg.from.x}, ${leg.from.y}` +
+      (leg.from.plane === 0 ? "" : `, verdieping ${leg.from.plane}`) +
+      ` → uitkomen op ${leg.to.x}, ${leg.to.y}` +
+      (leg.to.plane === 0 ? "" : `, verdieping ${leg.to.plane}`),
+  ];
+
+  if (leg.objectInfo !== null && leg.objectInfo !== leg.displayInfo) {
+    lines.push(`- In het spel: ${leg.objectInfo}`);
+  }
+
+  if (planned.matchedOn === null) {
+    lines.push(
+      "- Geen eisen bekend voor dit transport. Dat betekent niet dat er geen zijn: de " +
+        "tabel koppelt op de tekst die Shortest Path meestuurt, en die staat hier niet in.",
+    );
+    return lines.join("\n");
+  }
+
+  if (planned.skills.length > 0) {
+    lines.push(`- Skills: ${planned.skills.join(", ")}`);
+  }
+  if (planned.quests.length > 0) {
+    lines.push(`- Quests: ${planned.quests.join(", ")}`);
+  }
+
+  if (planned.alternatives.length === 0) {
+    lines.push("- Geen items nodig.");
+  } else if (planned.alternatives.length === 1) {
+    lines.push(`- Nodig: ${planned.alternatives[0]!.items.map(formatNeed).join(" en ")}`);
+  } else {
+    const usable = planned.alternatives.filter((alternative) => alternative.satisfied === true);
+    lines.push(
+      `- Nodig: één van ${nl(planned.alternatives.length)} mogelijkheden` +
+        (usable.length > 0 ? ` — ${nl(usable.length)} daarvan heb je liggen:` : ":"),
+    );
+    // De bruikbare eerst: dat is het antwoord op "kan ik hier langs".
+    const ordered = [
+      ...planned.alternatives.filter((alternative) => alternative.satisfied === true),
+      ...planned.alternatives.filter((alternative) => alternative.satisfied !== true),
+    ];
+    for (const alternative of ordered.slice(0, 8)) {
+      const mark = alternative.satisfied === null ? "?" : alternative.satisfied ? "✓" : "✗";
+      lines.push(`  - ${mark} ${alternative.items.map(formatNeed).join(" en ")}`);
+    }
+    if (ordered.length > 8) {
+      lines.push(`  - … en nog ${nl(ordered.length - 8)} mogelijkheid(en).`);
+    }
+  }
+
+  if (planned.ambiguous) {
+    lines.push(
+      `- Let op: "${planned.matchedOn}" komt in de brondata op meer dan één plek voor, ` +
+        "met verschillende eisen. Ze staan hierboven allemaal; welke hier geldt is niet " +
+        "met zekerheid te zeggen.",
+    );
+  }
+
+  return lines.join("\n");
+};
+
+server.registerTool(
+  "plan_route",
+  {
+    title: "De route naar de gezette bestemming in tekst",
+    description:
+      "Leest de route die Shortest Path heeft berekend voor de bestemming die met " +
+      "set_destination is gezet, en beschrijft de etappes: welke boten, teleports, " +
+      "fairy rings en shortcuts erin zitten, en welke items, quests en levels die " +
+      "vragen. Items worden op item-ID tegen de bank en de inventory gelegd, dus je " +
+      "ziet meteen wat je al hebt liggen. **Verandert niets in de client** — zet eerst " +
+      "een bestemming met set_destination. De route komt uit de plugin zelf, dus hij is " +
+      "altijd dezelfde als de lijn die op de kaart staat.",
+    inputSchema: {},
+  },
+  async () => {
+    let plan: RoutePlan | null;
+    try {
+      plan = await planRoute();
+    } catch (error: unknown) {
+      return {
+        content: [{ type: "text", text: destinationError(error, "het uitlezen van de route") }],
+        isError: true,
+      };
+    }
+
+    if (plan === null) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Er ligt nog geen berekende route. Zet eerst een bestemming met " +
+              "`set_destination`; Shortest Path rekent dan en de plugin schrijft de " +
+              "etappes weg. Staat er wel een pad op de kaart maar hier niets, dan is " +
+              "dat pad met de rechtermuisknop in de client gezet en niet via deze server.",
+          },
+        ],
+      };
+    }
+
+    const stale = plan.route.seq < plan.currentSeq;
+    const lines = [
+      "# Route naar de gezette bestemming",
+      "",
+      `- Berekend op ${plan.route.timestamp}` +
+        (plan.route.ageSeconds === null ? "" : ` (${formatAge(plan.route.ageSeconds)} geleden)`),
+      `- ${nl(plan.route.legs.length)} transport(en) onderweg`,
+    ];
+
+    if (stale) {
+      lines.push(
+        "",
+        `**Let op: deze route hoort bij een eerdere opdracht** (route ${nl(plan.route.seq)}, ` +
+          `laatste opdracht ${nl(plan.currentSeq)}). Shortest Path was waarschijnlijk nog ` +
+          "aan het rekenen. Vraag het zo nog eens; wat hieronder staat gaat over de vorige " +
+          "bestemming.",
+      );
+    }
+
+    lines.push("", "## Bronnen", "");
+    for (const source of plan.sources) {
+      lines.push(`- ${source.kind}: ${source.ok ? source.note : `**niet gelezen** — ${source.note}`}`);
+    }
+    if (!plan.itemNamesResolved) {
+      lines.push(
+        "- wiki-item-index: **niet gelezen**. Items die je niet bezit staan daarom alleen " +
+          "met hun ID vermeld.",
+      );
+    }
+    if (plan.sources.every((source) => !source.ok)) {
+      lines.push(
+        "",
+        "**Geen enkele bron met bezit is gelezen.** Alles hieronder staat daarom op " +
+          "'bezit onbekend' — dat is iets anders dan 'je hebt het niet'.",
+      );
+    }
+
+    if (plan.legs.length === 0) {
+      lines.push(
+        "",
+        "De route bevat geen transports: hij is volledig te voet. Loop de lijn op de " +
+          "kaart na; er is onderweg niets nodig.",
+      );
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+
+    lines.push("", "## Etappes", "");
+    plan.legs.forEach((planned, position) => {
+      lines.push(formatPlannedLeg(planned, position + 1), "");
+    });
+
+    lines.push(
+      "Dit zijn de transports die Shortest Path in de berekende route gebruikt, in de " +
+        "volgorde van het pad; de loopstukken ertussen staan er niet in. De eisen komen " +
+        "uit dezelfde brondata als de route zelf. Runes voor teleportspreuken staan daar " +
+        "niet bij — die zijn dus niet tegen je bank gelegd.",
+    );
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
   },
 );
 

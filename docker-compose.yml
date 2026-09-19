@@ -8,10 +8,20 @@ services:
     volumes:
       # De snapshots van de RuneLite-plugin. De keten is: Windows schrijft via
       # SMB naar de NAS, LXC 108 mount diezelfde dataset via NFS op
-      # /mnt/osrs-data, en die map hangt hier read-only onder /data. De
-      # container spreekt dus zelf geen NFS; hij ziet een gewone map.
-      # Read-only omdat de server alleen leest — schrijven is de plugin.
-      - /mnt/osrs-data:/data:ro
+      # /mnt/osrs-data, en die map hangt hier onder /data. De container spreekt
+      # dus zelf geen NFS; hij ziet een gewone map.
+      #
+      # Niet langer read-only. Dat was het tot ORS-016, omdat alle data één
+      # kant op ging: de plugin schrijft, de server leest. set_destination
+      # keert dat om — de server legt hier command.json neer en de plugin
+      # kijkt daar elke seconde naar. Zonder schrijfrecht faalt die ene tool
+      # met een nette uitleg en blijft de rest werken; mét schrijfrecht kan de
+      # server precies één ding extra, namelijk een bestemming laten tekenen.
+      # Er is geen codepad dat klikt of de speler verplaatst.
+      #
+      # De snapshots zelf worden hier nooit aangeraakt: de server schrijft
+      # alleen command.json en leest alle andere bestanden.
+      - /mnt/osrs-data:/data
     environment:
       # De map met de snapshots van de RuneLite-plugin (zie volumes). Hangt de
       # NFS-mount niet, dan is /data leeg of afwezig en zeggen get_bank en

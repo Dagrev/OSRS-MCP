@@ -210,3 +210,213 @@ export const describePlace = (
 
   return { landmark, region, summary };
 };
+
+/* ------------------------------------------------------------------ *
+ * Zoeken: van een gewone naam naar een coördinaat
+ * ------------------------------------------------------------------ */
+
+export interface DestinationCandidate {
+  name: string;
+  category: string;
+  /** Een representatieve tegel van dit punt; zie {@link searchLandmarks}. */
+  x: number;
+  y: number;
+  plane: number;
+  /** Hoeveel tegels er onder deze naam en soort vallen — een bank is zelden één tegel. */
+  tileCount: number;
+  /**
+   * Waar dit punt ligt ten opzichte van de andere punten met dezelfde naam, als er
+   * meerdere zijn: "westelijk", "oostelijk". Null als de naam maar één plek aanduidt.
+   */
+  areaHint: string | null;
+  /** Hoe goed de naam op de zoekterm paste; alleen om te sorteren. */
+  score: number;
+}
+
+/**
+ * Woorden die een soort punt aanduiden in plaats van een plek. "varrock bank" moet de
+ * bank van Varrock vinden en niet elk punt met "bank" in de naam, dus deze woorden
+ * worden tegen de categorie gelegd en niet tegen de naam.
+ */
+const CATEGORY_WORDS: Readonly<Record<string, string>> = {
+  bank: "bank",
+  banken: "bank",
+  bankchest: "bank",
+  altaar: "altaar",
+  altar: "altaar",
+  altars: "altaar",
+  altaren: "altaar",
+  teleport: "teleport",
+  teleports: "teleport",
+  tele: "teleport",
+};
+
+/**
+ * Verder dan dit uit elkaar zijn het twee plekken en niet één.
+ *
+ * Vijfentwintig tiles. "Varrock" staat als banknaam op elf tegels, maar dat zijn de
+ * west- én de oostbank, achtenzestig tiles uit elkaar. Die middelen tot één punt levert
+ * een coördinaat op die naar geen van beide wijst, en dat is het ergste soort antwoord:
+ * het ziet er precies zo uit als een goed antwoord. Een bank zelf beslaat hooguit een
+ * tegel of tien, dus alles daarboven is een tweede plek.
+ */
+const CLUSTER_TILES = 25;
+
+type Tile = [number, number, number];
+
+/**
+ * Deelt tegels op in groepen die bij elkaar in de buurt liggen.
+ *
+ * Enkelvoudige koppeling: een tegel hoort bij een groep zodra hij bij één tegel daarvan
+ * dichtbij genoeg ligt, en groepen die daardoor aan elkaar raken worden samengevoegd. Bij
+ * elf tegels per naam is de kwadratische kosten daarvan niet het overwegen waard.
+ */
+const clusterPoints = (points: Tile[]): Tile[][] => {
+  const clusters: Tile[][] = [];
+
+  for (const point of points) {
+    const touching = clusters.filter((cluster) =>
+      cluster.some(
+        (other) => Math.hypot(other[0] - point[0], other[1] - point[1]) <= CLUSTER_TILES,
+      ),
+    );
+
+    if (touching.length === 0) {
+      clusters.push([point]);
+      continue;
+    }
+
+    const merged = [point, ...touching.flat()];
+    for (const cluster of touching) {
+      clusters.splice(clusters.indexOf(cluster), 1);
+    }
+    clusters.push(merged);
+  }
+
+  return clusters;
+};
+
+const centreOf = (points: Tile[]): [number, number] => [
+  points.reduce((sum, point) => sum + point[0], 0) / points.length,
+  points.reduce((sum, point) => sum + point[1], 0) / points.length,
+];
+
+/**
+ * De tegel die het dichtst bij het midden van de groep ligt.
+ *
+ * Het midden zélf teruggeven zou een coördinaat opleveren die geen bankkist is — bij een
+ * L-vormige bank ligt dat punt buiten de bank. Dit is altijd een echte tegel uit de bron.
+ */
+const medoid = (points: Tile[]): Tile => {
+  const [centreX, centreY] = centreOf(points);
+  let best = points[0]!;
+  let bestDistance = Infinity;
+
+  for (const point of points) {
+    const distance = Math.hypot(point[0] - centreX, point[1] - centreY);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = point;
+    }
+  }
+
+  return best;
+};
+
+/** Kleine letters, geen leestekens, enkele spaties. */
+const normalise = (value: string): string =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+/**
+ * Zoekt benoemde punten op een gewone naam: "varrock bank", "edgeville", "altaar".
+ *
+ * Alle woorden moeten raken — óf in de naam van het punt, óf op de soort. Dat is
+ * strenger dan "een van de woorden" en dat is met opzet: "varrock bank" hoort niet de
+ * bank van Ardougne op te leveren omdat daar toevallig ook "bank" bij staat.
+ *
+ * Meerdere tegels onder dezelfde naam worden één kandidaat. Een bank beslaat vaak zes
+ * tot tien tegels en die als losse resultaten tonen zou de lijst vullen met hetzelfde
+ * antwoord. De tegel die terugkomt is die het dichtst bij het midden van de groep ligt —
+ * niet zomaar de eerste, want dat is een hoek van de bank en soms net de verkeerde kant
+ * van een muur.
+ */
+export const searchLandmarks = (query: string, limit = 10): DestinationCandidate[] => {
+  const tokens = normalise(query).split(" ").filter((token) => token.length > 0);
+  if (tokens.length === 0) return [];
+
+  /** Alle tegels per naam+soort, zodat de groep daarna te middelen is. */
+  const groups = new Map<
+    string,
+    { name: string; category: string; points: Tile[]; score: number }
+  >();
+
+  for (const [lx, ly, lplane, name, categoryIndex] of LANDMARKS) {
+    const category = LANDMARK_CATEGORIES[categoryIndex] ?? "punt";
+    const haystack = normalise(name);
+
+    let score = 0;
+    const matchesAll = tokens.every((token) => {
+      if (CATEGORY_WORDS[token] === category) {
+        score += 1;
+        return true;
+      }
+      if (haystack === token) {
+        score += 100;
+        return true;
+      }
+      if (haystack.startsWith(`${token} `)) {
+        score += 50;
+        return true;
+      }
+      if (haystack.includes(token)) {
+        score += 10;
+        return true;
+      }
+      return false;
+    });
+    if (!matchesAll) continue;
+
+    // Precies de gezochte naam weegt zwaarder dan dezelfde woorden in een langere naam:
+    // wie "varrock" zoekt bedoelt zelden "Varrock: Grand Exchange".
+    if (haystack === tokens.join(" ")) score += 200;
+
+    const key = `${name}|${category}`;
+    const group = groups.get(key) ?? { name, category, points: [], score: 0 };
+    group.points.push([lx, ly, lplane]);
+    group.score = Math.max(group.score, score);
+    groups.set(key, group);
+  }
+
+  const candidates: DestinationCandidate[] = [];
+  for (const group of groups.values()) {
+    const clusters = clusterPoints(group.points);
+
+    // Het midden van álle tegels met deze naam, om de clusters onderling te kunnen
+    // benoemen: de westbank van Varrock ligt westelijk van dat midden, de oostbank
+    // oostelijk. Alleen zinvol als er meer dan één cluster is.
+    const centre = centreOf(group.points);
+
+    for (const cluster of clusters) {
+      const representative = medoid(cluster);
+      candidates.push({
+        name: group.name,
+        category: group.category,
+        x: representative[0],
+        y: representative[1],
+        plane: representative[2],
+        tileCount: cluster.length,
+        areaHint:
+          clusters.length > 1
+            ? compass(representative[0] - centre[0], representative[1] - centre[1])
+            : null,
+        score: group.score,
+      });
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name, "en"));
+  return candidates.slice(0, limit);
+};

@@ -61,6 +61,10 @@ De inspector opent in de browser. Onder **Tools** staat `ping`; die geeft
 | `get_bank`        | —                                      | Laatste bank-snapshot van de RuneLite-plugin.                    |
 | `get_player_state` | —                                     | Waar de speler staat en hoe hij ervoor staat, uit de RuneLite-plugin. |
 | `check_materials` | `item`, `quantity`, `sources`, `username`, `accountType` | "Heb ik de materialen voor X?" — recept, bank/inventory en skills in één antwoord. |
+| `find_destination` | `query`, `limit`                   | Zoekt een plek op naam en geeft de coördinaten terug.            |
+| `set_destination` | `name` of `x`/`y`, `plane`             | Laat Shortest Path een pad naar die plek in de client tekenen.   |
+| `clear_destination` | —                                    | Haalt dat pad weer weg.                                          |
+| `plan_route`      | —                                      | De transports in de berekende route, met de items die ze vragen. |
 
 `accountType` is optioneel en is er een van `normal` (standaard), `ironman`,
 `hardcore_ironman`, `ultimate_ironman`, `group_ironman` of
@@ -234,6 +238,93 @@ Twee dingen die de aanduiding *niet* is:
   er expliciet bij dat de aanduiding over het gekopieerde gebied gaat en niet
   over wat de speler om zich heen ziet.
 
+### Bestemmingen zetten
+
+`set_destination` laat de [Shortest Path](https://github.com/Skretzo/shortest-path)-plugin
+een pad naar een bestemming op de wereldkaart en in de client tekenen.
+`clear_destination` haalt het weer weg, `find_destination` zoekt een plek op
+naam, en `plan_route` leest de berekende route voor.
+
+**Dit zet alleen een markering.** Er wordt niets aangeklikt, geen menu-actie
+verstuurd en de speler wordt niet verplaatst — niet als optie, niet achter een
+configvlag. Het account is een group ironman; lopen doet de eigenaar zelf. Dat
+is nagelopen en blijft na te lopen: in de plugin is `client` uitsluitend in
+getters te vinden en gaat er precies twee keer een `eventBus.post` de deur uit,
+beide met een `PluginMessage` naar Shortest Path.
+
+#### Hoe het loopt
+
+Alle andere data gaat één kant op: de plugin schrijft, de server leest. Voor een
+bestemming moet het de andere kant op, en dat gaat over hetzelfde bestandspad:
+
+1. De server schrijft `command.json` in de gedeelde map (atomisch, met een
+   oplopend volgnummer).
+2. De plugin kijkt daar elke seconde naar en post bij een nieuw nummer een
+   `PluginMessage` in namespace `shortestpath` — `path` met een `target`, of
+   `clear`.
+3. De plugin schrijft `command-ack.json` met het resultaat, en de server wacht
+   daarop tot twintig seconden.
+4. Shortest Path rekent, post de gebruikte transports terug, en de plugin
+   schrijft die naar `route.json`. Dat is wat `plan_route` voorleest.
+
+De `postTransports`-override uit stap 2 blijft bij Shortest Path staan tot een
+`clear`. Zet je na een opdracht zelf een pad met de rechtermuisknop, dan wordt
+dat dus ook naar `route.json` geschreven, onder het volgnummer van de laatste
+opdracht. `plan_route` kan die twee niet uit elkaar houden en beschrijft dan de
+route die er werkelijk ligt — wat waar is, maar niet per se waar je om vroeg.
+
+Stap 3 is het punt van de hele opzet. Een `PluginMessage` aan een plugin die
+niet draait verdwijnt zonder foutmelding; zonder ack zou "bestemming gezet"
+terugkomen terwijl er niets gebeurde. Elke manier waarop het misgaat heeft
+daarom een eigen status: Shortest Path niet geïnstalleerd, Shortest Path
+uitgeschakeld, niemand ingelogd, opdracht onzinnig, kanaal uitgezet in de
+plugin-instellingen. Blijft het antwoord helemaal uit, dan zegt de tool dat
+niet vast te stellen is of de bestemming gezet is — niet dat het gelukt is.
+
+**De datamap moet hiervoor beschrijfbaar zijn.** Tot ORS-016 hing `/data`
+read-only in de container. Staat `:ro` er nog, dan falen alleen deze twee tools,
+met een melding die uitlegt wat eraan moet gebeuren; de rest blijft werken.
+
+#### De route in tekst
+
+`plan_route` verzint zelf geen route. Shortest Path berekent hem en meldt de
+gebruikte transports terug — boten, teleports, fairy rings, agility shortcuts —
+en die lijst is wat hier voorgelezen wordt. Twee pathfinders naast elkaar zouden
+vroeg of laat twee antwoorden geven, en dan spreekt de tekst de lijn op de kaart
+tegen.
+
+Wat dat bericht níét meestuurt, zijn de eisen per transport. Die staan in
+dezelfde TSV's waar Shortest Path zijn kaartkennis uit haalt;
+`scripts/build-transports.mjs` haalt ze daaruit op en zet ze op de
+aankondigingstekst van het transport. `plan_route` legt ze vervolgens op item-ID
+tegen de bank en de inventory, net als `check_materials` — dus je ziet meteen
+welke teleport je al hebt liggen.
+
+Twee beperkingen om te kennen:
+
+- **Runes voor teleportspreuken staan niet in de brondata.** Bij "Varrock
+  Teleport" komt "25 Magic" terug en geen runekosten; die zijn dus ook niet
+  tegen je bank gelegd.
+- **Er wordt op tekst gekoppeld, niet op coördinaat.** Komt dezelfde
+  aankondigingstekst in de TSV's op meer plekken voor met andere eisen, dan
+  worden ze allemaal getoond met de melding dat niet vast te stellen is welke
+  hier geldt.
+
+#### Zoeken op naam
+
+`find_destination` zoekt in dezelfde tabel die `get_player_state` voor zijn
+plaatsaanduiding gebruikt: banken, altaren en teleportbestemmingen uit Shortest
+Path. Een willekeurig gebouw of een dungeon-ingang staat er niet in — geef dan
+de coördinaat rechtstreeks aan `set_destination`.
+
+Tegels met dezelfde naam die bij elkaar liggen worden één kandidaat, met de
+middelste tegel als coördinaat. Liggen ze verder dan 25 tiles uit elkaar, dan
+zijn het twee plekken en komen ze apart terug met een windrichting erbij: de
+bank van "Varrock" is de westbank op 3185, 3440 én de oostbank op 3254, 3420,
+en die middelen tot één punt zou een coördinaat opleveren die naar geen van
+beide wijst. Passen er meerdere even goed, dan zet `set_destination` niets en
+vraagt het welke bedoeld wordt.
+
 ### Bronnen combineren (`check_materials`)
 
 `check_materials` beantwoordt "heb ik de materialen voor X?" door drie bronnen
@@ -280,7 +371,11 @@ in je toolbelt zitten.
 De server draait als Docker-container in LXC 108 (`osrsmcp`,
 `192.168.1.154`) op de Proxmox-host, bereikbaar op
 `http://192.168.1.154:3000/mcp`. Alleen LAN, plain HTTP, geen authenticatie —
-gelijk aan de Obsidian-MCP, en het zijn alleen leestools.
+gelijk aan de Obsidian-MCP.
+
+Op één na zijn het leestools. `set_destination` en `clear_destination` schrijven
+een opdracht naar de gedeelde map; wat zo'n opdracht kan is uitsluitend een lijn
+op de kaart laten tekenen. Zie [Bestemmingen](#bestemmingen-zetten).
 
 Intern blijft de server stdio; `supergateway` zet daar HTTP voor. Er staat geen
 netwerkcode in `src/`.
@@ -419,8 +514,9 @@ de goedkoopste test: die geeft de servertijd van de container terug.
 
 ### De RuneLite-kant
 
-Drie van de tools (`get_inventory`, `get_bank`, `get_player_state`) en een deel van
-`check_materials` leunen op de plugin
+De tools die op de spelmachine leunen (`get_inventory`, `get_bank`,
+`get_player_state`, `set_destination`, `clear_destination`, `plan_route`) en een
+deel van `check_materials` gebruiken de plugin
 ["OSRS Item Check"](../OSRS%20item%20check). Die staat niet op de Plugin Hub en
 moet dus zelf draaien:
 
@@ -428,9 +524,10 @@ moet dus zelf draaien:
    of zet de gebouwde jar in `~/.runelite/sideloaded-plugins/` en start
    RuneLite met `--developer-mode`.
 2. Zet de plugin aan in het configuratiescherm.
-3. Zet in de plugin-instellingen **alle drie de bestandspaden** op het NAS-pad,
-   niet op het standaardpad: dat van de inventory, dat van de bank en dat van de
-   spelstaat (`playerStateFilePath`). Het zijn losse instellingen, dus een
+3. Zet in de plugin-instellingen **alle zes de bestandspaden** op het NAS-pad,
+   niet op het standaardpad: inventory, bank, spelstaat
+   (`playerStateFilePath`), en voor de bestemmingen ook `commandFilePath`,
+   `commandAckFilePath` en `routeFilePath`. Het zijn losse instellingen, dus een
    vergeten pad blijft stil naar de spelmachine schrijven. De server draait in
    de container en leest `/data`; alleen via de NAS-share zien die twee dezelfde
    bestanden. Let op: elk pad is een **bestandsnaam**, geen map — op een map
@@ -439,7 +536,11 @@ moet dus zelf draaien:
    als je hem in-game opent. De spelstaat komt bij de eerste tick na inloggen.
 
 Voor `get_quests` is daarnaast de WikiSync-plugin nodig, zie
-[Questvoortgang](#questvoortgang-wikisync).
+[Questvoortgang](#questvoortgang-wikisync). Voor de bestemmingen is
+[Shortest Path](https://github.com/Skretzo/shortest-path) uit de Plugin Hub
+nodig; staat die er niet of uit, dan zeggen `set_destination` en
+`clear_destination` dat met zoveel woorden. De schakelaar "Accept destination
+commands" in de plugin-instellingen zet het hele kanaal uit als je dat wilt.
 
 ### Als het niet werkt
 
@@ -454,5 +555,10 @@ Voor `get_quests` is daarnaast de WikiSync-plugin nodig, zie
 | `get_player_state` zegt "niet actueel" terwijl er wel gespeeld wordt | De hartslag komt niet door: de schrijfactie naar de share faalt (een lezer die het bestand vasthoudt kan de atomaire rename blokkeren) of de klok van de spelmachine loopt uit de pas. Herstelt normaal zelf bij de volgende schrijfactie. |
 | De plaatsaanduiding klopt niet met wat je in het spel ziet | Sta je in een instance (POH, Gauntlet, raid)? Dan is de coördinaat die van de gekopieerde sjabloontegel; de tool zegt dat er ook bij. |
 | Bank is oud terwijl inventory actueel is | Geen storing: de bank wordt alleen bij het openen in-game herschreven. |
+| `set_destination` zegt "geen antwoord van de plugin" | RuneLite draait niet, de plugin staat uit, "Accept destination commands" staat uit, of `commandFilePath` wijst niet naar dezelfde map als de server. Controleer met `get_player_state` of de client nog schrijft. |
+| `set_destination` zegt dat de datamap niet beschrijfbaar is | Het `/data`-volume in `docker-compose.yml` staat nog op `:ro`, of de NFS-export op de NAS is read-only. Alleen deze twee tools raken dat; de leestools blijven werken. |
+| `set_destination` zegt dat Shortest Path niet geïnstalleerd is terwijl hij wel draait | Skretzo heeft de plugin hernoemd. De koppeling gaat op de descriptor-naam "Shortest Path"; die staat als constante in `ItemCheckPlugin`. |
+| `plan_route` zegt dat er nog geen route ligt | Er is sinds het opstarten geen bestemming via de server gezet, of Shortest Path rekent nog. |
+| `plan_route` beschrijft een andere route dan je verwacht | Zet je na een `set_destination` zelf een pad met rechtsklik, dan wordt dat ook weggeschreven: de `postTransports`-override blijft bij Shortest Path aan tot een `clear_destination`. De route is dan wél echt, alleen niet die van je laatste opdracht. |
 | `curl` geeft "No valid session ID provided" | Verwacht. De gateway draait stateful; na `initialize` hoort de `mcp-session-id`-header mee. Echte clients doen dat, handmatige `curl` niet. |
 | Een tool die je verwacht ontbreekt in de lijst | De container draait een oudere versie. Uitrollen: `git pull` + `docker compose up -d --build` in LXC 108. |
