@@ -26,6 +26,16 @@ import {
   type ContainerData,
   type ContainerKind,
 } from "./plugindata.js";
+import {
+  DEAD_AFTER_SECONDS,
+  HEARTBEAT_SECONDS,
+  PLAYER_STATE_FILE,
+  WRITE_INTERVAL_SECONDS,
+  playerStateHint,
+  readPlayerState,
+  type PlayerState,
+} from "./playerstate.js";
+import { LANDMARK_MAX_TILES } from "./landmarks.js";
 import { checkMaterials, type MaterialCheck, type MaterialsReport, type RecipeCheck } from "./materials.js";
 import {
   WikiError,
@@ -841,6 +851,170 @@ server.registerTool(
     inputSchema: {},
   },
   async () => respondWithContainer("bank"),
+);
+
+/* ------------------------------------------------------------------ *
+ * Live spelstaat — positie, run energy, HP en prayer
+ * ------------------------------------------------------------------ */
+
+/** "55/55 (100%)" — de verhouding is waar het om gaat, niet het losse getal. */
+const formatRatio = (current: number | null, max: number | null): string => {
+  if (current === null || max === null) return "onbekend";
+  if (max <= 0) return `${current}/${max}`;
+  return `${current}/${max} (${Math.round((current / max) * 100)}%)`;
+};
+
+/**
+ * Wat de leeftijd van dit bestand betekent. Anders dan bij de bank is "oud"
+ * hier een uitspraak over de client en niet over het spelen: de hartslag van de
+ * plugin schrijft ook als er niets verandert, dus een oud tijdstempel betekent
+ * dat er niet meer geschreven wordt.
+ */
+const playerStateFreshness = (state: PlayerState): string => {
+  if (state.ageSeconds === null) {
+    return (
+      `- **Leeftijd onbekend**: "${state.timestamp}" is niet als datum te lezen. ` +
+      `Het bestand is voor het laatst gewijzigd op ${state.fileModified}; ga van ` +
+      "die tijd uit en behandel de staat hieronder met voorbehoud."
+    );
+  }
+
+  const age = formatAge(state.ageSeconds);
+
+  if (state.ageSeconds > DEAD_AFTER_SECONDS) {
+    return (
+      `- **Deze staat is ${age} oud en dus niet actueel.** De plugin schrijft ` +
+      `ook zonder dat er iets verandert, elke ${HEARTBEAT_SECONDS} seconden. ` +
+      `Staat er langer dan ${DEAD_AFTER_SECONDS} seconden niets bij, dan draait ` +
+      "de client vrijwel zeker niet meer — of hij kan de map niet bereiken. Dit " +
+      "is de laatst bekende stand, niet waar de speler nu staat. Zeg dat er ook " +
+      "bij: antwoorden die van de positie afhangen zijn nu onbetrouwbaar."
+    );
+  }
+
+  if (state.ageSeconds > HEARTBEAT_SECONDS + 10) {
+    return (
+      `- **Let op: ${age} oud**, net iets meer dan de hartslag van ` +
+      `${HEARTBEAT_SECONDS} seconden. Waarschijnlijk kwam één schrijfactie niet ` +
+      "door (dat herstelt zichzelf) of loopt de klok van de spelmachine iets uit " +
+      "de pas. Behandel het als vrijwel actueel, maar niet als zeker."
+    );
+  }
+
+  return (
+    `- ${age} oud — de client draait en dit is de huidige stand. De plugin ` +
+    `verschrijft hooguit eens per ${WRITE_INTERVAL_SECONDS} seconden, dus tot ` +
+    "die marge kan de speler alweer een paar tiles verder zijn."
+  );
+};
+
+const formatPlayerState = (state: PlayerState): string => {
+  const lines = [
+    "# Spelstaat volgens de RuneLite-plugin",
+    "",
+    `- Tijdstempel uit de snapshot: ${state.timestamp}`,
+    playerStateFreshness(state),
+    `- Gelezen uit: ${state.path}`,
+    "",
+    "## Waar",
+    "",
+    `- **${state.place.summary}**`,
+    `- Coördinaat: ${state.x}, ${state.y} — verdieping ${state.plane}` +
+      (state.plane === 0 ? " (grondniveau)" : ""),
+    `- Region-ID: ${state.regionId}${
+      state.place.region === null ? " (niet in de gebiedstabel)" : ` (${state.place.region})`
+    }`,
+    `- In een instance: ${state.inInstance ? "ja" : "nee"}`,
+  ];
+
+  if (state.place.landmark === null) {
+    lines.push(
+      `- Geen benoemd punt binnen ${LANDMARK_MAX_TILES} tiles. De landmarktabel ` +
+        "kent banken, altaren en teleportbestemmingen; in leeg gebied, een " +
+        "dungeon of een instance ligt daar niets van in de buurt.",
+    );
+  }
+
+  lines.push(
+    "",
+    "## Hoe het ervoor staat",
+    "",
+    `- Run energy: ${state.runEnergy === null ? "onbekend" : `${state.runEnergy}%`}`,
+    `- Hitpoints: ${formatRatio(state.hpCurrent, state.hpMax)}`,
+    `- Prayer: ${formatRatio(state.prayerCurrent, state.prayerMax)}`,
+    `- Combat level: ${state.combatLevel ?? "onbekend"}`,
+    "",
+    "## Account",
+    "",
+    `- Speler: ${state.playerName ?? "onbekend"}`,
+    `- Wereld: ${state.world ?? "onbekend"}`,
+  );
+
+  // HP en prayer zijn *boosted* tegenover *real*: een lopende boost of drain
+  // zit er dus in, maar het huidige getal alleen verraadt niet welk van de twee.
+  lines.push(
+    "",
+    "Hitpoints en prayer zijn de actuele waarden tegenover het echte level, dus " +
+      "een boost of drain zit erin verwerkt. Staat er meer dan het echte level, " +
+      "dan werkt er een boost; staat er minder, dan is er schade of prayer " +
+      "verbruikt.",
+  );
+
+  if (state.missingFields.length > 0) {
+    lines.push(
+      "",
+      `Let op: de velden ${state.missingFields.join(", ")} stonden niet in het ` +
+        "bestand of waren niet van het verwachte type, en staan hierboven als " +
+        "'onbekend'. Mogelijk is het formaat van de plugin gewijzigd; de positie " +
+        "zelf is wel gelezen.",
+    );
+  }
+
+  lines.push(
+    "",
+    "Deze data komt van de plugin op de spelmachine, niet uit het spel zelf. Er " +
+      "wordt niets gecached, dus opnieuw opvragen leest het bestand opnieuw — " +
+      "maar het bestand zelf ververst hooguit eens per " +
+      `${WRITE_INTERVAL_SECONDS} seconden.`,
+  );
+
+  return lines.join("\n");
+};
+
+server.registerTool(
+  "get_player_state",
+  {
+    title: "OSRS spelstaat ophalen",
+    description:
+      "Leest waar de speler staat en hoe hij ervoor staat: coördinaat, " +
+      "verdieping, region-ID, een leesbare plaatsaanduiding (het dichtstbijzijnde " +
+      "bekende punt met afstand en windrichting), run energy, hitpoints, prayer, " +
+      "combat level en de wereld. Gebruik dit voor elke vraag die van de positie " +
+      `afhangt — 'is dit dichtbij', 'kan ik dit halen', 'heb ik genoeg run ` +
+      "energy'. De plugin verschrijft de staat alleen bij verandering en hooguit " +
+      `eens per ${WRITE_INTERVAL_SECONDS} seconden, plus een hartslag van ` +
+      `${HEARTBEAT_SECONDS} seconden; aan het tijdstempel is dus te zien of de ` +
+      "client nog draait. Is de bron niet te lezen, dan komt er een foutmelding " +
+      `— nooit een verzonnen positie. ${playerStateHint()}`,
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      return {
+        content: [{ type: "text" as const, text: formatPlayerState(await readPlayerState()) }],
+      };
+    } catch (error: unknown) {
+      const message =
+        error instanceof PluginDataError
+          ? error.message
+          : `Onverwachte fout bij het lezen van ${PLAYER_STATE_FILE}: ${
+              error instanceof Error ? error.message : String(error)
+            }`;
+      const kindLabel = error instanceof PluginDataError ? error.kind : "unexpected";
+      log(`get_player_state mislukt (${kindLabel}): ${message}`);
+      return { content: [{ type: "text" as const, text: message }], isError: true };
+    }
+  },
 );
 
 /* ------------------------------------------------------------------ *

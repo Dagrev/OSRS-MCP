@@ -21,6 +21,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 /** Welke container er opgevraagd wordt; tegelijk de bestandsnaam. */
+/**
+ * Naast de containers hieronder schrijft de plugin `player-state.json` in
+ * dezelfde map. Dat is geen container maar één snapshotobject, dus het heeft
+ * zijn eigen module: `playerstate.ts`.
+ */
 export const CONTAINERS = {
   inventory: { file: "inventory.json", label: "inventory" },
   bank: { file: "bank.json", label: "bank" },
@@ -101,8 +106,13 @@ export interface ContainerData {
  */
 export const STALE_AFTER_SECONDS = 15 * 60;
 
-/** Onderscheidt "map weg" van "map leeg" van "bestand weg". */
-const inspectDataDir = async (dir: string): Promise<string[]> => {
+/**
+ * Onderscheidt "map weg" van "map leeg" van "bestand weg".
+ *
+ * Geëxporteerd omdat `playerstate.ts` uit dezelfde map leest en precies
+ * dezelfde drie gevallen moet kunnen onderscheiden.
+ */
+export const inspectDataDir = async (dir: string): Promise<string[]> => {
   try {
     return await readdir(dir);
   } catch (error: unknown) {
@@ -114,8 +124,8 @@ const inspectDataDir = async (dir: string): Promise<string[]> => {
     if (code === "ENOENT") {
       throw new PluginDataError(
         "dir_unavailable",
-        `De datamap bestaat niet: "${dir}". ${hint} Dit zegt niets over de ` +
-          "inhoud van de bank of inventory — de bron is simpelweg niet te " +
+        `De datamap bestaat niet: "${dir}". ${hint} Dit zegt niets over wat ` +
+          "de plugin heeft weggeschreven — de bron is simpelweg niet te " +
           "vinden. Controleer of de map klopt en, in de container, of de " +
           "NAS-mount er nog is.",
       );
@@ -124,7 +134,8 @@ const inspectDataDir = async (dir: string): Promise<string[]> => {
       throw new PluginDataError(
         "dir_unavailable",
         `Geen leesrechten op de datamap "${dir}". ${hint} De data is dus niet ` +
-          "op te vragen; dat is iets anders dan een lege bank.",
+          "op te vragen; dat is iets anders dan een lege bank of een speler " +
+          "die nergens staat.",
       );
     }
     throw new PluginDataError(

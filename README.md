@@ -59,6 +59,7 @@ De inspector opent in de browser. Onder **Tools** staat `ping`; die geeft
 | `get_drop_table`  | `monster`, `include_rare_drop_table`   | Drop table met de uitgerekende kans per kill.                    |
 | `get_inventory`   | —                                      | Laatste inventory-snapshot van de RuneLite-plugin.               |
 | `get_bank`        | —                                      | Laatste bank-snapshot van de RuneLite-plugin.                    |
+| `get_player_state` | —                                     | Waar de speler staat en hoe hij ervoor staat, uit de RuneLite-plugin. |
 | `check_materials` | `item`, `quantity`, `sources`, `username`, `accountType` | "Heb ik de materialen voor X?" — recept, bank/inventory en skills in één antwoord. |
 
 `accountType` is optioneel en is er een van `normal` (standaard), `ironman`,
@@ -175,6 +176,63 @@ ontbreekt" zijn expres verschillende meldingen.
 
 De bank wordt door de plugin alleen herschreven als je hem in-game opent; die
 snapshot is dus vaak dagen oud zonder dat er iets mis is.
+
+### Live spelstaat (`get_player_state`)
+
+`get_player_state` leest `player-state.json` uit dezelfde map als de bank en de
+inventory. De plugin schrijft dat bestand niet op een event maar op een tick,
+**alleen als er iets verandert en hooguit eens per 5 seconden**, plus een
+**hartslag van 60 seconden**. Het antwoord bevat:
+
+- coördinaat (`x`, `y`), verdieping en region-ID;
+- een leesbare plaatsaanduiding — het dichtstbijzijnde bekende punt met afstand
+  en windrichting, plus het gebied;
+- of de speler in een instance staat;
+- run energy, hitpoints, prayer en combat level;
+- naam en wereld.
+
+**De leeftijd betekent hier iets anders dan bij de bank.** Doordat de hartslag
+ook schrijft als er niets verandert, is een oud tijdstempel geen teken dat er
+stilgestaan wordt maar dat er niet meer geschreven wórdt. De tool zegt dat ook
+zo:
+
+| Leeftijd              | Wat de tool erover zegt                                  |
+| --------------------- | -------------------------------------------------------- |
+| tot ~70 seconden      | de client draait, dit is de huidige stand                |
+| ~70 tot 150 seconden  | vrijwel actueel; één schrijfactie kwam vermoedelijk niet door |
+| ouder dan 150 seconden | **niet actueel** — de client draait vrijwel zeker niet meer |
+
+De foutpaden zijn dezelfde vijf als bij de bank en de inventory hierboven; ook
+deze tool geeft nooit een verzonnen positie bij een storing. Ontbreekt `x`, `y`,
+`plane` of `regionId`, dan is het een fout — de rest van de velden komt als
+"onbekend" terug met een opmerking eronder.
+
+#### De plaatsaanduiding
+
+Ruwe coördinaten zijn voor een taalmodel onbruikbaar, dus die worden omgezet
+naar "51 tiles ten noordoosten van de teleportbestemming Lumbridge —
+Misthalin". Dat gebeurt in drie lagen, van precies naar grof:
+
+1. het dichtstbijzijnde benoemde punt binnen 200 tiles — banken, altaren en
+   teleportbestemmingen;
+2. het gebied dat bij het region-ID hoort (Misthalin, Asgarnia, Varlamore, …);
+3. niets — dan blijven de ruwe coördinaten het antwoord.
+
+De tabel staat in `src/landmarkdata.ts` en is **gegenereerd**: opnieuw opbouwen
+met `node scripts/build-landmarks.mjs`, dat de TSV-bestanden van de
+[Shortest Path](https://github.com/Skretzo/shortest-path)-plugin ophaalt. Dat is
+het enige moment dat er netwerk aan te pas komt; de lookup zelf is rekenwerk op
+een tabel in de code.
+
+Twee dingen die de aanduiding *niet* is:
+
+- **Geen looproute.** De afstand is hemelsbreed. Boven de 100 tiles zegt de tool
+  dat er water, een muur of een berg tussen kan zitten — routes zijn het werk
+  van Shortest Path, niet van deze server.
+- **Niet betrouwbaar in een instance.** De plugin geeft daar de coördinaat van
+  de gekopieerde sjabloontegel. Staat `inInstance` op `true`, dan zegt de tool
+  er expliciet bij dat de aanduiding over het gekopieerde gebied gaat en niet
+  over wat de speler om zich heen ziet.
 
 ### Bronnen combineren (`check_materials`)
 
@@ -361,7 +419,7 @@ de goedkoopste test: die geeft de servertijd van de container terug.
 
 ### De RuneLite-kant
 
-Twee van de tools (`get_inventory`, `get_bank`) en een deel van
+Drie van de tools (`get_inventory`, `get_bank`, `get_player_state`) en een deel van
 `check_materials` leunen op de plugin
 ["OSRS Item Check"](../OSRS%20item%20check). Die staat niet op de Plugin Hub en
 moet dus zelf draaien:
@@ -370,13 +428,15 @@ moet dus zelf draaien:
    of zet de gebouwde jar in `~/.runelite/sideloaded-plugins/` en start
    RuneLite met `--developer-mode`.
 2. Zet de plugin aan in het configuratiescherm.
-3. Zet in de plugin-instellingen de **uitvoermap** op het NAS-pad, niet op het
-   standaardpad. De server draait in de container en leest `/data`; alleen via
-   de NAS-share zien die twee dezelfde bestanden. Op het standaardpad
-   (`~/.runelite/osrs-item-check/`) schrijft de plugin naar de spelmachine en
-   ziet de server niets.
+3. Zet in de plugin-instellingen **alle drie de bestandspaden** op het NAS-pad,
+   niet op het standaardpad: dat van de inventory, dat van de bank en dat van de
+   spelstaat (`playerStateFilePath`). Het zijn losse instellingen, dus een
+   vergeten pad blijft stil naar de spelmachine schrijven. De server draait in
+   de container en leest `/data`; alleen via de NAS-share zien die twee dezelfde
+   bestanden. Let op: elk pad is een **bestandsnaam**, geen map — op een map
+   gezet krijgt de plugin `AccessDeniedException`.
 4. Log in, en open één keer de bank — de bank-snapshot wordt alleen geschreven
-   als je hem in-game opent.
+   als je hem in-game opent. De spelstaat komt bij de eerste tick na inloggen.
 
 Voor `get_quests` is daarnaast de WikiSync-plugin nodig, zie
 [Questvoortgang](#questvoortgang-wikisync).
@@ -390,6 +450,9 @@ Voor `get_quests` is daarnaast de WikiSync-plugin nodig, zie
 | Alle tools werken, maar `get_bank` en `get_inventory` zeggen "bron niet te vinden" of "mount waarschijnlijk niet aangehaakt" | De NAS-share is niet gemount in LXC 108, of niet in de container. De tools zeggen dit expres in plaats van een lege bank terug te geven. |
 | Bank en inventory bestaan wel, maar zijn van weken geleden | De plugin schrijft nog naar het oude lokale pad. Controleer de uitvoermap in de plugin-instellingen. |
 | Bestanden ontbreken terwijl de map wel gevuld is | De plugin staat uit, of RuneLite draait zonder de plugin. |
+| `player-state.json` ontbreekt terwijl `bank.json` er wel staat | Ofwel `playerStateFilePath` wijst niet naar deze map (het is een eigen instelling, zie stap 3), ofwel de jar achter de snelkoppeling is ouder dan de spelstaat en moet opnieuw gebouwd worden. |
+| `get_player_state` zegt "niet actueel" terwijl er wel gespeeld wordt | De hartslag komt niet door: de schrijfactie naar de share faalt (een lezer die het bestand vasthoudt kan de atomaire rename blokkeren) of de klok van de spelmachine loopt uit de pas. Herstelt normaal zelf bij de volgende schrijfactie. |
+| De plaatsaanduiding klopt niet met wat je in het spel ziet | Sta je in een instance (POH, Gauntlet, raid)? Dan is de coördinaat die van de gekopieerde sjabloontegel; de tool zegt dat er ook bij. |
 | Bank is oud terwijl inventory actueel is | Geen storing: de bank wordt alleen bij het openen in-game herschreven. |
 | `curl` geeft "No valid session ID provided" | Verwacht. De gateway draait stateful; na `initialize` hoort de `mcp-session-id`-header mee. Echte clients doen dat, handmatige `curl` niet. |
 | Een tool die je verwacht ontbreekt in de lijst | De container draait een oudere versie. Uitrollen: `git pull` + `docker compose up -d --build` in LXC 108. |
