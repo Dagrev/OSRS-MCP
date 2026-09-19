@@ -263,7 +263,8 @@ bestemming moet het de andere kant op, en dat gaat over hetzelfde bestandspad:
    `PluginMessage` in namespace `shortestpath` — `path` met een `target`, of
    `clear`.
 3. De plugin schrijft `command-ack.json` met het resultaat, en de server wacht
-   daarop tot twintig seconden.
+   daarop — tot twee minuten als de spelstaat vers is, tot 25 seconden als die
+   al stilstond (dan draait de client waarschijnlijk toch niet).
 4. Shortest Path rekent, post de gebruikte transports terug, en de plugin
    schrijft die naar `route.json`. Dat is wat `plan_route` voorleest.
 
@@ -280,6 +281,15 @@ daarom een eigen status: Shortest Path niet geïnstalleerd, Shortest Path
 uitgeschakeld, niemand ingelogd, opdracht onzinnig, kanaal uitgezet in de
 plugin-instellingen. Blijft het antwoord helemaal uit, dan zegt de tool dat
 niet vast te stellen is of de bestemming gezet is — niet dat het gelukt is.
+
+**Reken op tientallen seconden vanuit de container.** Draait de server op
+dezelfde machine als de client, dan is het antwoord er in een halve seconde.
+Vanuit LXC 108 niet: die schrijft via NFS naar de NAS terwijl de plugin
+hetzelfde bestand via SMB leest, en de SMB-client ziet een schrijfactie van de
+andere kant pas als zijn cache verloopt. Gemeten op 2026-09-19: 35, 46 en 85
+seconden voor dezelfde opdracht. De oorzaak is `cache=strict` op de
+CIFS-mount, maar die mount draagt ook de Obsidian-vault — daarom wordt er
+gewacht in plaats van de mount omgezet.
 
 **De datamap moet hiervoor beschrijfbaar zijn.** Tot ORS-016 hing `/data`
 read-only in de container. Staat `:ro` er nog, dan falen alleen deze twee tools,

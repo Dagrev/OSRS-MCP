@@ -33,14 +33,31 @@ export const ROUTE_FILE = "route.json";
 export const PLUGIN_POLL_SECONDS = 1;
 
 /**
- * Hoe lang er op een antwoord gewacht wordt.
+ * Hoe lang er op een antwoord gewacht wordt als de client aantoonbaar leeft.
  *
- * Twintig seconden. De plugin pollt elke seconde, dus normaal is het antwoord er binnen
- * twee; de rest is marge voor een trage netwerkshare aan beide kanten. Korter zou een
- * SMB-hapering laten doorkomen als "geen antwoord", en dat is een veel alarmerender
- * melding dan de situatie verdient.
+ * Honderdtwintig seconden, en dat is geen slag in de lucht. Schrijft de server op
+ * dezelfde machine als de client, dan is het antwoord er in een halve seconde. Vanuit de
+ * container niet: die schrijft via NFS naar de NAS, terwijl de plugin hetzelfde bestand
+ * via SMB leest, en de SMB-client ziet een schrijfactie van de andere kant pas als zijn
+ * cache verloopt. Gemeten op 2026-09-19 vanuit LXC 108: 35, 46 en 85 seconden voor
+ * dezelfde opdracht.
+ *
+ * De oorzaak zit in `cache=strict` op de CIFS-mount, maar die mount draagt ook de
+ * Obsidian-vault — hem op `cache=none` zetten om deze ene tool sneller te maken is de
+ * verkeerde afweging. Dus wachten we gewoon langer.
  */
-export const ACK_TIMEOUT_MS = 20_000;
+export const ACK_TIMEOUT_MS = 120_000;
+
+/**
+ * Hoe lang er gewacht wordt als de spelstaat zegt dat er niemand speelt.
+ *
+ * Twee minuten wachten om daarna "de client draait niet" te melden is onnodig traag voor
+ * verreweg de meest voorkomende fout. Staat de spelstaat stil, dan is de kans groot dat
+ * er niets gaat antwoorden — maar zeker is het niet (de plugin luistert ook op het
+ * inlogscherm, waar de spelstaat per definitie veroudert), dus er wordt wél verstuurd en
+ * kort gewacht in plaats van meteen geweigerd.
+ */
+export const ACK_TIMEOUT_IDLE_MS = 25_000;
 
 /**
  * Hoe lang er daarna nog op de route gewacht wordt.
@@ -196,11 +213,11 @@ const writeCommand = async (command: Record<string, unknown>): Promise<void> => 
 };
 
 /** Wacht tot het antwoordbestand bij dit loopnummer hoort. */
-const waitForAck = async (seq: number): Promise<CommandResult> => {
+const waitForAck = async (seq: number, timeoutMs: number, clientSeemsLive: boolean): Promise<CommandResult> => {
   const started = Date.now();
   const path = filePath(ACK_FILE);
 
-  while (Date.now() - started < ACK_TIMEOUT_MS) {
+  while (Date.now() - started < timeoutMs) {
     await sleep(POLL_INTERVAL_MS);
 
     const ack = await readJson(path);
@@ -226,16 +243,39 @@ const waitForAck = async (seq: number): Promise<CommandResult> => {
     };
   }
 
+  const seconds = Math.round(timeoutMs / 1000);
   throw new CommandChannelError(
     "no_answer",
     `De opdracht staat in "${filePath(COMMAND_FILE)}", maar er kwam binnen ` +
-      `${Math.round(ACK_TIMEOUT_MS / 1000)} seconden geen antwoord van de plugin. De ` +
-      "plugin kijkt elke seconde, dus dit betekent vrijwel zeker dat RuneLite niet " +
-      "draait, dat de plugin \"OSRS Item Check\" uit staat, dat hij naar een andere map " +
-      "kijkt dan deze server, of dat de optie \"Accept destination commands\" uit staat. " +
-      "Controleer met get_player_state of de client überhaupt nog schrijft. **Er is niet " +
-      "vast te stellen of de bestemming gezet is** — ga ervan uit van niet.",
+      `${seconds} seconden geen antwoord van de plugin. ` +
+      (clientSeemsLive
+        ? "De spelstaat was wél vers, dus de client draait. Kijk of de plugin \"OSRS " +
+          "Item Check\" aan staat, of de optie \"Accept destination commands\" aan " +
+          "staat, en of het commandobestand in de plugin-instellingen naar dezelfde map " +
+          "wijst als deze server."
+        : "De spelstaat was ook al niet vers, dus waarschijnlijk draait RuneLite niet of " +
+          "is er niemand ingelogd. Controleer dat met get_player_state.") +
+      " **Er is niet vast te stellen of de bestemming gezet is** — ga ervan uit van niet.",
   );
+};
+
+/**
+ * Of de spelstaat kort geleden nog ververst is.
+ *
+ * Leest `player-state.json` rechtstreeks in plaats van via `playerstate.ts`: hier is
+ * alleen het tijdstempel interessant, en een onleesbaar of ontbrekend bestand is geen
+ * fout maar gewoon "niet vers".
+ */
+const playerStateIsFresh = async (): Promise<boolean> => {
+  const state = await readJson(filePath("player-state.json"));
+  const timestamp = state?.["timestamp"];
+  if (typeof timestamp !== "string") return false;
+
+  const parsed = Date.parse(timestamp);
+  if (Number.isNaN(parsed)) return false;
+
+  // Dezelfde grens als playerstate.ts hanteert voor "de client draait niet meer".
+  return (Date.now() - parsed) / 1000 <= 150;
 };
 
 /**
@@ -254,6 +294,10 @@ export const sendCommand = async (
   // vooral om een verkeerde mount te betrappen vóór er een opdracht in het niets belandt.
   await inspectDataDir(dataDir());
 
+  // Of de client leeft bepaalt alleen hoe lang we wachten, niet of we versturen. Zie
+  // ACK_TIMEOUT_IDLE_MS voor waarom dat geen weigering is.
+  const clientSeemsLive = await playerStateIsFresh();
+
   const seq = await nextSeq();
   await writeCommand({
     seq,
@@ -266,7 +310,11 @@ export const sendCommand = async (
     postTransports: action === "path",
   });
 
-  return await waitForAck(seq);
+  return await waitForAck(
+    seq,
+    clientSeemsLive ? ACK_TIMEOUT_MS : ACK_TIMEOUT_IDLE_MS,
+    clientSeemsLive,
+  );
 };
 
 /** De route zoals de plugin hem laatst opving, of null als er nog geen ligt. */
