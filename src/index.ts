@@ -257,6 +257,34 @@ const formatSkillsFromSnapshot = (
 
   lines.push(`| **Overall** | **${totalLevel}** | **${nl(totalXp)}** | ${rankOf("Overall")} |`);
 
+  // Overall is hier een som en geen gemeten waarde: de snapshot kent hem niet. Wijkt hij
+  // af van de hiscores, dan komt dat doordat de plugin een skill niet wegschrijft die daar
+  // wél meetelt — Sailing, op het moment van schrijven. Zwijgen zou betekenen dat iemand
+  // een totaal van 738 naast een hiscore-pagina van 739 legt en gaat zoeken naar een fout
+  // die er niet is. De regel noemt de skills bij naam, zodat hij blijft kloppen als er
+  // later nog een bijkomt.
+  const hiscoresOverall = hiscores?.skills.find((s) => s.name === "Overall")?.level ?? null;
+  if (hiscoresOverall !== null && hiscoresOverall !== totalLevel) {
+    const missing = (hiscores?.skills ?? [])
+      .filter(
+        (entry) =>
+          entry.name !== "Overall" &&
+          entry.level !== null &&
+          snapshot.skills[entry.name.toUpperCase()] === undefined,
+      )
+      .map((entry) => `${entry.name} (${entry.level})`);
+
+    lines.push(
+      "",
+      `**Overall is hier opgeteld uit de ${nl(Object.keys(snapshot.skills).length)} skills ` +
+        `die de plugin wegschrijft en komt op ${totalLevel}; de hiscores zeggen ` +
+        `${hiscoresOverall}.** ` +
+        (missing.length > 0
+          ? `Het verschil zit in ${missing.join(", ")} — die telt de plugin niet mee.`
+          : "Welke skill het verschil maakt, is hier niet te zien."),
+    );
+  }
+
   lines.push(
     "",
     `Level en XP komen uit de snapshot van ${snapshot.ageSeconds} seconden geleden ` +
