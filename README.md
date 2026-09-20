@@ -66,6 +66,7 @@ De inspector opent in de browser. Onder **Tools** staat `ping`; die geeft
 | `set_destination` | `name` of `x`/`y`, `plane`             | Laat Shortest Path een pad naar die plek in de client tekenen.   |
 | `clear_destination` | —                                    | Haalt dat pad weer weg.                                          |
 | `plan_route`      | —                                      | De transports in de berekende route, met de items die ze vragen. |
+| `set_step`        | `instruction`, `note`, `timeoutSeconds`, `condition`, `clear` | Legt de actieve stap en zijn conditie vast in `current-step.json`. |
 
 `accountType` is optioneel en is er een van `normal` (standaard), `ironman`,
 `hardcore_ironman`, `ultimate_ironman`, `group_ironman` of
@@ -389,6 +390,71 @@ Gereedschap en faciliteiten (hamer, aambeeld, zaagmolen) worden genoemd maar
 niet tegen de bank gelegd: een aambeeld ligt niet in je bank en een hamer kan
 in je toolbelt zitten.
 
+### De actieve stap (`set_step`)
+
+`set_step` legt één stap voor de speler vast in `current-step.json` op de
+gedeelde map: de instructie in gewone taal, en de conditie waaraan te zien is
+dat hij uitgevoerd is. De overlay in de plugin toont die stap, en een
+wachtscript wacht tot de conditie waar wordt. Het formaat staat in het
+Stapcontract in de vault (`20 Projects/OSRS stapcoach/Docs/Ontwerp/`); wijkt er
+iets af, dan hoort de wijziging in dat document en niet hier.
+
+Er wordt **niet** op een bevestiging gewacht, en dat is het verschil met
+`set_destination`. Daar moest het wel: een `PluginMessage` aan een plugin die
+niet draait verdwijnt zonder foutmelding. Hier is de uitkomst een bestand dat
+blijft staan, en de lezers pakken het op wanneer ze er zijn. Een ack-lus zou
+alleen kosten hebben — de richting server → plugin is de trage kant.
+
+Elke aanroep verhoogt het volgnummer. Een lezer onthoudt het nummer dat hij
+verwerkte; ziet hij een hoger nummer, dan is de stap vervangen en stopt hij met
+wachten. Draaien er twee sessies, dan overschrijven die elkaar; het volgnummer
+maakt dat zichtbaar en verder wordt het niet opgelost.
+
+Wissen gaat met `clear: true` en is een eigen aanroep, niet een `set_step`
+zonder instructie. Dat laat de envelop leeg achter — instructie en conditie op
+`null` — in plaats van het laatste bevel te laten staan, en verhoogt het
+volgnummer net zo goed.
+
+#### Waarom de validatie zo streng is
+
+Claude stelt de conditie zelf op en er zit niemand tussen die hem naleest. Een
+typefout in een veldnaam (`minQty` in plaats van `minQuantity`), een skill in
+kleine letters, een quest die net anders heet: dat levert een conditie op die
+er goed uitziet en nooit afgaat. De speler wacht dan tien minuten op iets dat
+technisch niet klaar kán komen.
+
+Daarom wordt een conditie geweigerd — en wordt er **niets** geschreven — bij een
+onbekend `type`, een onbekend veld binnen een knoop, een ontbrekend verplicht
+veld, een verkeerd type, een onbekende `skill`, `quest`, `container` of `state`,
+een negatieve drempel, een `all` of `any` met minder dan twee elementen, of meer
+dan drie combinatoren boven elkaar of zestien bladeren. De melding noemt alles
+wat er mis is in één keer, met het pad erbij (`condition.of[1].minQuantity`) en
+waar mogelijk een suggestie: `MINNING` levert "bedoelde je MINING?" op.
+
+Twee dingen zijn strenger dan het contract letterlijk eist, om dezelfde reden:
+een `minLevel` boven 99 en een `plane` boven 3 bestaan niet in het spel, dus zo'n
+conditie gaat per definitie nooit af.
+
+De questnaam is de constante uit RuneLite's `Quest`-enum (`COOKS_ASSISTANT`),
+niet de weergavenaam. Die lijst staat in `src/questdata.ts` en is gegenereerd
+met `scripts/build-quests.mjs` uit de `runelite-api`-jar die de plugin ook
+gebruikt. Komt er een quest bij, dan moet die tabel opnieuw gegenereerd worden —
+anders weigert `set_step` een conditie die op zichzelf klopt.
+
+#### Een relatief XP-doel
+
+"Vijftig XP erbij" kan niet als zodanig worden opgeslagen: een lezer weet dan
+niet vanaf wanneer. Geef daarom `xpGain` mee in plaats van `minXp`, dan rekent
+`set_step` het bij het schrijven om naar een absolute drempel, met de stand uit
+`skills.json` als basis. Die basis komt mee in het bestand als `baselineXp` en
+`baselineAt` — toelichting voor mens en overlay; de evaluator kijkt alleen naar
+`minXp`.
+
+Is `skills.json` ouder dan 120 seconden, dan wordt het geweigerd. Een basis uit
+een dode client levert een drempel op die allang gehaald is, of er nooit komt.
+Zolang de plugin dat bestand nog niet schrijft (ORS-019) werkt alleen de
+absolute vorm met `minXp`.
+
 ## Deployen op de homelab
 
 De server draait als Docker-container in LXC 108 (`osrsmcp`,
@@ -396,9 +462,12 @@ De server draait als Docker-container in LXC 108 (`osrsmcp`,
 `http://192.168.1.154:3000/mcp`. Alleen LAN, plain HTTP, geen authenticatie —
 gelijk aan de Obsidian-MCP.
 
-Op één na zijn het leestools. `set_destination` en `clear_destination` schrijven
+Op drie na zijn het leestools. `set_destination` en `clear_destination` schrijven
 een opdracht naar de gedeelde map; wat zo'n opdracht kan is uitsluitend een lijn
-op de kaart laten tekenen. Zie [Bestemmingen](#bestemmingen-zetten).
+op de kaart laten tekenen. Zie [Bestemmingen](#bestemmingen-zetten). `set_step`
+legt de actieve stap in een bestand op diezelfde map — zie
+[De actieve stap](#de-actieve-stap-set_step). Geen van de drie klikt iets aan en
+geen van de drie verplaatst de speler.
 
 Intern blijft de server stdio; `supergateway` zet daar HTTP voor. Er staat geen
 netwerkcode in `src/`.
