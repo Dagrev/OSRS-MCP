@@ -52,8 +52,8 @@ De inspector opent in de browser. Onder **Tools** staat `ping`; die geeft
 | Tool              | Argumenten                             | Beschrijving                                                     |
 | ----------------- | -------------------------------------- | ---------------------------------------------------------------- |
 | `ping`            | —                                      | Bereikbaarheidstest; geeft de servertijd (ISO 8601).             |
-| `get_skills`      | `username`, `accountType`              | Level, XP en rank per skill uit de OSRS Hiscores.                |
-| `get_quests`      | `username`, `filter`                   | Status per quest (niet gestart / bezig / afgerond) via WikiSync.  |
+| `get_skills`      | `username`, `accountType`              | Level, XP en rank per skill — uit de plugin-snapshot als die vers is, anders de Hiscores. |
+| `get_quests`      | `username`, `filter`                   | Status per quest — uit de plugin-snapshot als die vers is, anders WikiSync. |
 | `lookup_item`     | `name`                                 | Item-eigenschappen uit de OSRS Wiki: ID, waarde, bonussen.       |
 | `lookup_monster`  | `name`                                 | Monster-stats uit de OSRS Wiki: combat, slayer, zwaktes.         |
 | `get_drop_table`  | `monster`, `include_rare_drop_table`   | Drop table met de uitgerekende kans per kill.                    |
@@ -101,7 +101,9 @@ zet er een placeholdernaam neer plus een waarschuwing in de uitvoer.
 
 ### Questvoortgang (WikiSync)
 
-`get_quests` leest de publieke WikiSync-data van de OSRS Wiki. `filter` is
+`get_quests` valt terug op de publieke WikiSync-data van de OSRS Wiki zodra de
+plugin-snapshot niet vers genoeg is; zie [Twee bronnen](#twee-bronnen-één-antwoord-ors-023).
+Diaries, combat achievements en muziek komen er altijd vandaan. `filter` is
 optioneel en is er een van `all` (standaard), `not_finished`, `in_progress`,
 `not_started` of `finished`. De tellingen bovenaan de uitvoer gaan altijd over
 alle quests, ook als er gefilterd wordt.
@@ -454,6 +456,83 @@ Is `skills.json` ouder dan 120 seconden, dan wordt het geweigerd. Een basis uit
 een dode client levert een drempel op die allang gehaald is, of er nooit komt.
 Zolang de plugin dat bestand nog niet schrijft (ORS-019) werkt alleen de
 absolute vorm met `minXp`.
+
+### Twee bronnen, één antwoord (`ORS-023`)
+
+Sinds de plugin `skills.json` en `quests.json` wegschrijft, weten twee bronnen
+hetzelfde: de snapshot van de draaiende client, en de publieke bronnen
+(Hiscores, WikiSync). Ze zijn het geregeld oneens — de hiscores verversen niet
+real-time, en WikiSync verstuurt alleen bij het inloggen. Zonder expliciete
+keuze bepaalt de volgorde in de code welk antwoord eruit komt.
+
+De regel geldt voor `get_skills`, `get_quests` en `check_materials`, en is
+overal dezelfde:
+
+1. Gaat de vraag over het account dat in de client is ingelogd, én is de
+   snapshot jonger dan **120 seconden**, dan wint de snapshot.
+2. In alle andere gevallen wint de publieke bron: een andere accountnaam, een
+   client die uit staat, een mount die weg is.
+3. **Elk antwoord zegt welke bron gebruikt is en waarom**, ook als er niets te
+   kiezen viel. Zou die regel alleen bij een keuze verschijnen, dan betekent
+   zijn afwezigheid iets — en dat is precies de stilte die dit moest wegnemen.
+
+#### Waarom 120 seconden
+
+Niet omdat het XP-bestand zo oud mag zijn. Dat is de valkuil: XP en queststatus
+veranderen alleen als de speler iets doet, dus "al een uur geen XP" is een
+volstrekt normale toestand tijdens een lange quest. Daar kun je geen versheid
+aan afmeten.
+
+Wat wél meet of de client leeft is de hartslag. `player-state.json` en
+`skills.json` schrijven allebei elke zestig seconden, ook als er niets gebeurt.
+Twee hartslagen is dus de grens waarboven de client aantoonbaar niet meer
+draait. Dezelfde grens die het Stapcontract in §5 hanteert.
+
+`playerstate.ts` houdt voor `get_player_state` 150 seconden aan. Dat is geen
+tegenspraak maar een andere vraag: daar gaat het om hoe een leeftijd beschreven
+wordt, met marge voor één mislukte schrijfreeks. Hier gaat het om een keuze
+tussen twee bronnen, en dan is de strengere grens de juiste.
+
+#### Wat de publieke bron blijft doen
+
+De snapshot verdringt de publieke bron niet, hij wint alleen waar ze hetzelfde
+weten. Drie dingen blijven:
+
+- **De rank** bestaat alleen bij de hiscores — dat is een positie in een
+  ranglijst. `get_skills` haalt ze dus ook op als de snapshot wint, en zet de
+  rank naast level en XP uit de client. Lukt dat niet, dan komt het antwoord er
+  zonder rank en mét uitleg, in plaats van helemaal niet.
+- **Diaries, combat achievements en muziek** schrijft de plugin niet weg.
+  `get_quests` haalt WikiSync dus altijd op, ook voor de weergavenamen: de
+  snapshot kent alleen `COOKS_ASSISTANT`.
+- **Een groepslid** heeft geen client bij jou draaien. Een andere `username`
+  gaat daarom altijd naar de publieke bron.
+
+Omdat beide bronnen er in die gevallen toch zijn, wordt een verschil **gemeld**
+in plaats van stil overschreven. Dat is geen foutmelding: het laat zien hoever
+de publieke bron achterloopt, en dat is precies het soort ding dat je wilt zien.
+
+De Group Ironman-toelichting — dat GIM geen eigen hiscore-tabel heeft — hoort
+alleen bij een antwoord uit de hiscores. Komt het uit de snapshot, dan blijft
+hij weg; hij zou dan over cijfers gaan die er niet vandaan komen.
+
+#### Namen koppelen
+
+Om de standen van de snapshot naast WikiSync te kunnen leggen moeten
+`COOKS_ASSISTANT` en `Cook's Assistant` aan elkaar. Dat gaat één kant op: de
+weergavenaam wordt naar de enumconstante omgerekend, want die kant verliest
+alleen leestekens in plaats van ze te verzinnen.
+
+Let op de volgorde in die omzetting: eerst alles weg wat geen letter, cijfer of
+spatie is, en pas dáárna spaties naar underscores — zonder reeksen samen te
+vouwen. De enum houdt namelijk de spaties rond een weggevallen teken alle twee
+aan: `Recipe for Disaster - Evil Dave` wordt `RECIPE_FOR_DISASTER__EVIL_DAVE`
+met twee underscores, en `Romeo & Juliet` wordt `ROMEO__JULIET`. Een regex die
+`[^A-Z0-9]+` in één keer op `_` zet koppelt dertien quests niet meer. Gemeten
+tegen de echte WikiSync-respons: 211 van de 212 namen koppelen, en de ene die
+overblijft is een invoer die letterlijk `.` heet.
+
+Namen die niet op een constante passen worden overgeslagen, niet geraden.
 
 ## Deployen op de homelab
 

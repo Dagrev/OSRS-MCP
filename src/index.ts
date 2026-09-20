@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   ACCOUNT_TYPES,
   HiscoresError,
+  SKILL_ORDER,
   fetchSkills,
   type AccountType,
   type HiscoresResult,
@@ -47,6 +48,17 @@ import {
   waitForRoute,
   type CommandResult,
 } from "./destination.js";
+import {
+  SNAPSHOT_MAX_AGE_SECONDS,
+  chooseSource,
+  prettifyQuestKey,
+  questKey,
+  readQuestsSnapshot,
+  readSkillsSnapshot,
+  type QuestsSnapshot,
+  type SkillsSnapshot,
+  type SourceChoice,
+} from "./authority.js";
 import {
   countLeaves,
   describeCondition,
@@ -111,10 +123,42 @@ server.registerTool(
   }),
 );
 
-const formatSkills = (result: HiscoresResult): string => {
+/**
+ * Eén regel die zegt waar het antwoord vandaan komt.
+ *
+ * Staat in élk antwoord van de drie tools die twee bronnen kennen, ook als er maar één
+ * beschikbaar was. Weglaten zodra er niets te kiezen valt zou betekenen dat de afwezigheid
+ * van die regel iets betekent, en dat is precies het soort stilte waar dit ticket vanaf wil.
+ */
+const sourceLine = (choice: SourceChoice): string => `**Bron:** ${choice.reason}`;
+
+/**
+ * Meldt waar de publieke bron van de verse snapshot afwijkt.
+ *
+ * Alleen zinvol als de snapshot gewonnen heeft: dan is de publieke bron toch opgehaald (voor
+ * de rank, of voor de diaries) en is het verschil gratis zichtbaar. Stil overschrijven zou
+ * betekenen dat een achterlopende hiscore-stand ongemerkt verdwijnt — terwijl juist dát
+ * verschil vertelt hoeveel de hiscores achterlopen.
+ */
+const disagreementNote = (differences: string[], what: string): string[] => {
+  if (differences.length === 0) return [];
+  return [
+    "",
+    `## De publieke bron zegt iets anders (${nl(differences.length)}×)`,
+    "",
+    ...differences.map((line) => `- ${line}`),
+    "",
+    `Dit is geen fout. ${what} De snapshot is gebruikt; dit staat erbij zodat zichtbaar is ` +
+      "hoever de publieke bron achterloopt.",
+  ];
+};
+
+const formatSkills = (result: HiscoresResult, choice: SourceChoice): string => {
   const lines = [
     `Skills voor "${result.username}" (${result.accountType}-hiscores)` +
       (result.cached ? " — uit cache, maximaal een minuut oud" : ""),
+    "",
+    sourceLine(choice),
     "",
     "| Skill | Level | XP | Rank |",
     "| --- | ---: | ---: | ---: |",
@@ -146,14 +190,120 @@ const formatSkills = (result: HiscoresResult): string => {
   return lines.join("\n");
 };
 
+/**
+ * Skills uit de plugin-snapshot, met de rank uit de hiscores erbij.
+ *
+ * De verdeling is niet willekeurig. Level en XP kent de snapshot beter dan wie ook: die
+ * komen uit de draaiende client. De rank kent hij helemaal niet — dat is een positie in een
+ * ranglijst en die bestaat alleen bij de hiscores. Klakkeloos overstappen op de snapshot zou
+ * die kolom laten verdwijnen; daarom worden de hiscores nog steeds opgehaald, alleen niet
+ * meer geloofd waar de snapshot iets weet.
+ */
+const formatSkillsFromSnapshot = (
+  username: string,
+  snapshot: SkillsSnapshot,
+  choice: SourceChoice,
+  hiscores: HiscoresResult | null,
+  hiscoresError: string | null,
+): string => {
+  const rankOf = (skillName: string): string => {
+    const entry = hiscores?.skills.find((s) => s.name === skillName);
+    return entry?.rank === null || entry?.rank === undefined
+      ? "—"
+      : entry.rank.toLocaleString("nl-NL");
+  };
+
+  const lines = [
+    `Skills voor "${username}"`,
+    "",
+    sourceLine(choice),
+    "",
+    "| Skill | Level | XP | Rank |",
+    "| --- | ---: | ---: | ---: |",
+  ];
+
+  let totalLevel = 0;
+  let totalXp = 0;
+  const differences: string[] = [];
+
+  // De volgorde van de hiscores aanhouden, zodat de tabel er hetzelfde uitziet als
+  // voorheen. `Overall` slaan we over: dat is een som en geen skill, en de snapshot kent
+  // hem niet — wij rekenen hem zelf uit.
+  for (const skillName of SKILL_ORDER) {
+    if (skillName === "Overall") continue;
+    const entry = snapshot.skills[skillName.toUpperCase()];
+    if (entry === undefined) continue;
+
+    totalLevel += entry.level;
+    totalXp += entry.xp;
+
+    const boosted =
+      entry.boostedLevel !== undefined && entry.boostedLevel !== entry.level
+        ? ` (nu ${entry.boostedLevel})`
+        : "";
+    lines.push(
+      `| ${skillName} | ${entry.level}${boosted} | ${nl(entry.xp)} | ${rankOf(skillName)} |`,
+    );
+
+    const publicEntry = hiscores?.skills.find((s) => s.name === skillName);
+    if (publicEntry !== undefined && publicEntry.xp !== null && publicEntry.xp !== entry.xp) {
+      differences.push(
+        `${skillName}: de hiscores staan op ${nl(publicEntry.xp)} XP` +
+          (publicEntry.level === null ? "" : ` (level ${publicEntry.level})`) +
+          `, de client op ${nl(entry.xp)} XP (level ${entry.level})`,
+      );
+    }
+  }
+
+  lines.push(`| **Overall** | **${totalLevel}** | **${nl(totalXp)}** | ${rankOf("Overall")} |`);
+
+  lines.push(
+    "",
+    `Level en XP komen uit de snapshot van ${snapshot.ageSeconds} seconden geleden ` +
+      `(${snapshot.timestamp}) en zijn het échte level, niet het geboostte. Staat er een ` +
+      "waarde tussen haakjes, dan is die skill op dit moment geboost.",
+  );
+
+  if (hiscores === null) {
+    lines.push(
+      "",
+      `**De rank ontbreekt**, want de hiscores waren niet te bereiken: ${hiscoresError}`,
+      "Level en XP kloppen wel — die komen niet van daar.",
+    );
+  } else {
+    lines.push(
+      "De rank komt wél van de hiscores, want die bestaat alleen daar. Hij hoort bij de " +
+        "stand van de laatste keer dat de hiscores ververst zijn.",
+    );
+  }
+
+  // De GIM-toelichting hoort hier juist níét te staan: die gaat erover dat Group Ironman
+  // geen eigen hiscore-tabel heeft, en dat is betekenisloos als de cijfers niet van de
+  // hiscores komen. Hem meenemen zou misleidend zijn.
+
+  lines.push(
+    ...disagreementNote(
+      differences,
+      "De hiscores verversen niet real-time, dus ze lopen normaal gesproken achter.",
+    ),
+  );
+
+  return lines.join("\n");
+};
+
 server.registerTool(
   "get_skills",
   {
     title: "OSRS skills ophalen",
     description:
-      "Haalt level, XP en rank per skill op uit de officiële OSRS Hiscores. " +
-      "Let op: de hiscores lopen achter op het spel en verversen niet real-time, " +
-      "dus net behaalde levels kunnen ontbreken. Gebruik de character name, niet de " +
+      "Haalt level, XP en rank per skill op. **Twee bronnen, en het antwoord zegt " +
+      "welke gebruikt is.** Draait de client van dit account en is de snapshot van de " +
+      "plugin jonger dan twee minuten, dan komen level en XP daaruit — die kunnen niet " +
+      "achterlopen. Anders komen ze uit de OSRS Hiscores, die niet real-time verversen, " +
+      "dus dan kan een net behaald level ontbreken. De rank komt altijd van de " +
+      "hiscores; die bestaat alleen daar. Wijken de twee af, dan staat dat erbij in " +
+      "plaats van dat het stil wordt overschreven. Een andere accountnaam dan die in " +
+      "de client gaat altijd naar de hiscores. Gebruik de character name, niet de " +
       "naam van het Jagex-account.",
     inputSchema: {
       username: usernameSchema.describe(
@@ -171,19 +321,39 @@ server.registerTool(
     },
   },
   async ({ username, accountType }) => {
+    const snapshot = await readSkillsSnapshot();
+    const choice = await chooseSource(username, snapshot?.ageSeconds ?? null);
+
+    // De hiscores worden ook opgehaald als de snapshot wint. Niet uit gewoonte: zij weten
+    // de rank, en die kent de plugin niet. Mislukt dat, dan is dat geen fout meer zolang
+    // de snapshot er is — een antwoord zonder rank is beter dan geen antwoord.
+    let hiscores: HiscoresResult | null = null;
+    let hiscoresError: string | null = null;
     try {
-      const result = await fetchSkills(username, accountType);
-      return { content: [{ type: "text", text: formatSkills(result) }] };
+      hiscores = await fetchSkills(username, accountType);
     } catch (error: unknown) {
-      const message =
+      hiscoresError =
         error instanceof HiscoresError
           ? error.message
           : `Onverwachte fout bij het ophalen van de skills: ${
               error instanceof Error ? error.message : String(error)
             }`;
-      log(`get_skills mislukt voor "${username}" (${accountType}): ${message}`);
-      return { content: [{ type: "text", text: message }], isError: true };
     }
+
+    if (choice.use === "snapshot" && snapshot !== null) {
+      return {
+        content: [
+          { type: "text", text: formatSkillsFromSnapshot(username, snapshot, choice, hiscores, hiscoresError) },
+        ],
+      };
+    }
+
+    if (hiscores === null) {
+      log(`get_skills mislukt voor "${username}" (${accountType}): ${hiscoresError}`);
+      return { content: [{ type: "text", text: hiscoresError! }], isError: true };
+    }
+
+    return { content: [{ type: "text", text: formatSkills(hiscores, choice) }] };
   },
 );
 
@@ -198,7 +368,11 @@ const QUEST_FILTERS = {
 
 type QuestFilter = keyof typeof QUEST_FILTERS;
 
-const formatQuests = (result: WikiSyncResult, filter: QuestFilter): string => {
+const formatQuests = (
+  result: WikiSyncResult,
+  filter: QuestFilter,
+  choice: SourceChoice,
+): string => {
   const counts: Record<QuestStatus, number> = {
     finished: 0,
     in_progress: 0,
@@ -210,6 +384,8 @@ const formatQuests = (result: WikiSyncResult, filter: QuestFilter): string => {
     `Quests voor "${result.username}" volgens WikiSync` +
       (result.cached ? " — uit cache, maximaal vijf minuten oud" : ""),
     ...(result.retrievedAt ? [`Opgehaald bij de wiki: ${result.retrievedAt}`] : []),
+    "",
+    sourceLine(choice),
     "",
     `Afgerond: ${counts.finished} van ${result.quests.length} · ` +
       `bezig: ${counts.in_progress} · niet gestart: ${counts.not_started}`,
@@ -265,16 +441,161 @@ const formatQuests = (result: WikiSyncResult, filter: QuestFilter): string => {
   return lines.join("\n");
 };
 
+/** De drie standen uit het contract naar de statusnamen die deze server al gebruikt. */
+const SNAPSHOT_QUEST_STATUS: Record<string, QuestStatus> = {
+  FINISHED: "finished",
+  IN_PROGRESS: "in_progress",
+  NOT_STARTED: "not_started",
+};
+
+/**
+ * Quests uit de plugin-snapshot, met de rest van WikiSync eromheen.
+ *
+ * De snapshot wint voor de queststanden, want die leest de varps van de draaiende client;
+ * WikiSync verstuurt alleen bij het inloggen en kan dus een hele avond achterlopen. Maar
+ * WikiSync blijft nodig voor drie dingen die de plugin niet wegschrijft — diaries, combat
+ * achievements en muziek — en voor de weergavenamen: de snapshot kent alleen
+ * `COOKS_ASSISTANT`, en die naam wil niemand in een lijst zien.
+ */
+const formatQuestsFromSnapshot = (
+  username: string,
+  snapshot: QuestsSnapshot,
+  filter: QuestFilter,
+  choice: SourceChoice,
+  wikiSync: WikiSyncResult | null,
+  wikiSyncError: string | null,
+): string => {
+  // Weergavenaam per enumconstante, uit WikiSync. Namen die niet op een constante passen
+  // worden overgeslagen in plaats van geraden — zie questKey.
+  const displayNames = new Map<string, string>();
+  const publicStatus = new Map<string, QuestStatus>();
+  if (wikiSync !== null) {
+    for (const quest of wikiSync.quests) {
+      const key = questKey(quest.name);
+      if (key.length === 0) continue;
+      displayNames.set(key, quest.name);
+      publicStatus.set(key, quest.status);
+    }
+  }
+
+  const counts: Record<QuestStatus, number> = { finished: 0, in_progress: 0, not_started: 0 };
+  const byStatus: Record<QuestStatus, string[]> = { finished: [], in_progress: [], not_started: [] };
+  const differences: string[] = [];
+  let unknownStates = 0;
+
+  for (const [key, rawState] of Object.entries(snapshot.quests)) {
+    const status = SNAPSHOT_QUEST_STATUS[rawState];
+    if (status === undefined) {
+      unknownStates += 1;
+      continue;
+    }
+
+    const name = displayNames.get(key) ?? prettifyQuestKey(key);
+    counts[status] += 1;
+    byStatus[status].push(name);
+
+    const other = publicStatus.get(key);
+    if (other !== undefined && other !== status) {
+      differences.push(
+        `${name}: WikiSync zegt ${QUEST_STATUS_LABEL[other].toLowerCase()}, de client ` +
+          `zegt ${QUEST_STATUS_LABEL[status].toLowerCase()}`,
+      );
+    }
+  }
+
+  for (const status of Object.keys(byStatus) as QuestStatus[]) {
+    byStatus[status].sort((a, b) => a.localeCompare(b, "nl"));
+  }
+
+  const total = counts.finished + counts.in_progress + counts.not_started;
+  const lines = [
+    `Quests voor "${username}"`,
+    "",
+    sourceLine(choice),
+    "",
+    `Afgerond: ${counts.finished} van ${total} · bezig: ${counts.in_progress} · ` +
+      `niet gestart: ${counts.not_started}`,
+  ];
+
+  for (const status of QUEST_FILTERS[filter]) {
+    const names = byStatus[status];
+    lines.push("", `## ${QUEST_STATUS_LABEL[status]} (${names.length})`);
+    lines.push(names.length > 0 ? names.map((n) => `- ${n}`).join("\n") : "(geen)");
+  }
+
+  if (wikiSync === null) {
+    lines.push(
+      "",
+      `**Diaries, combat achievements en muziek ontbreken**, want WikiSync was niet te ` +
+        `bereiken: ${wikiSyncError}`,
+      "De queststanden hierboven kloppen wel — die komen niet van daar. En de namen zijn " +
+        "afgeleid van de enumconstante, dus leestekens kunnen ontbreken.",
+    );
+  } else {
+    const { diaries, combatAchievements, musicTracks } = wikiSync.extras;
+    if (diaries.length > 0 || combatAchievements !== null || musicTracks !== null) {
+      lines.push("", "## Ook meegekomen, uit WikiSync");
+      if (diaries.length > 0) {
+        const done = diaries.filter((d) => d.completed.length === d.all.length).length;
+        lines.push(
+          `- Achievement diaries: ${done} van ${diaries.length} regio's volledig af. ` +
+            diaries
+              .map((d) => `${d.region}: ${d.completed.length > 0 ? d.completed.join("/") : "geen"}`)
+              .join(" · "),
+        );
+      }
+      if (combatAchievements !== null) {
+        lines.push(`- Combat achievements voltooid: ${combatAchievements}`);
+      }
+      if (musicTracks !== null) {
+        lines.push(`- Muzieknummers vrijgespeeld: ${musicTracks.unlocked} van ${musicTracks.total}`);
+      }
+      lines.push(
+        "",
+        "Die drie komen nog steeds van WikiSync, want de plugin schrijft ze niet weg. Ze " +
+          "zijn dus van de laatste sync en niet van nu.",
+      );
+    }
+  }
+
+  lines.push(
+    "",
+    `De standen komen uit de snapshot van ${snapshot.ageSeconds} seconden geleden ` +
+      `(${snapshot.timestamp}), rechtstreeks uit de varps van de client.`,
+  );
+
+  if (unknownStates > 0) {
+    lines.push(
+      `Let op: ${nl(unknownStates)} quest(s) in de snapshot hadden een stand die deze ` +
+        "server niet kent en zijn overgeslagen. Mogelijk lopen de plugin en deze server " +
+        "uit de pas qua versie.",
+    );
+  }
+
+  lines.push(
+    ...disagreementNote(
+      differences,
+      "WikiSync verstuurt alleen bij het inloggen, dus die momentopname kan een hele avond oud zijn.",
+    ),
+  );
+
+  return lines.join("\n");
+};
+
 server.registerTool(
   "get_quests",
   {
     title: "OSRS questvoortgang ophalen",
     description:
-      "Haalt per quest op of die niet gestart, bezig of afgerond is, via de publieke " +
-      "WikiSync-data van de OSRS Wiki. Dit vereist dat het account ooit heeft " +
-      "ingelogd met de RuneLite-plugin WikiSync aan; de data is de momentopname van " +
-      "die laatste sync en niet live. Gebruik de character name, niet de naam van " +
-      "het Jagex-account.",
+      "Haalt per quest op of die niet gestart, bezig of afgerond is. **Twee bronnen, en " +
+      "het antwoord zegt welke gebruikt is.** Draait de client van dit account en is " +
+      "de snapshot van de plugin jonger dan twee minuten, dan komen de standen " +
+      "daaruit — rechtstreeks uit de varps, dus van nu. Anders komen ze uit de " +
+      "publieke WikiSync-data van de OSRS Wiki, die alleen bij het inloggen verstuurd " +
+      "wordt en dus een hele avond oud kan zijn. Diaries, combat achievements en " +
+      "muziek komen altijd van WikiSync; die schrijft de plugin niet weg. Wijken de " +
+      "twee af, dan staat dat erbij. Een andere accountnaam gaat altijd naar " +
+      "WikiSync. Gebruik de character name, niet de naam van het Jagex-account.",
     inputSchema: {
       username: usernameSchema.describe(
         "De OSRS-accountnaam, bijvoorbeeld 'Mr Bilel'.",
@@ -290,19 +611,42 @@ server.registerTool(
     },
   },
   async ({ username, filter }) => {
+    const snapshot = await readQuestsSnapshot();
+    const choice = await chooseSource(username, snapshot?.ageSeconds ?? null);
+
+    // WikiSync wordt ook opgehaald als de snapshot wint: daar zitten de diaries, combat
+    // achievements en muziek in, en dat weet de plugin niet. Bovendien levert het de
+    // weergavenamen waarmee de enumconstanten leesbaar getoond kunnen worden.
+    let wikiSync: WikiSyncResult | null = null;
+    let wikiSyncError: string | null = null;
     try {
-      const result = await fetchWikiSync(username);
-      return { content: [{ type: "text", text: formatQuests(result, filter) }] };
+      wikiSync = await fetchWikiSync(username);
     } catch (error: unknown) {
-      const message =
+      wikiSyncError =
         error instanceof WikiSyncError
           ? error.message
           : `Onverwachte fout bij het ophalen van de questvoortgang: ${
               error instanceof Error ? error.message : String(error)
             }`;
-      log(`get_quests mislukt voor "${username}": ${message}`);
-      return { content: [{ type: "text", text: message }], isError: true };
     }
+
+    if (choice.use === "snapshot" && snapshot !== null) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: formatQuestsFromSnapshot(username, snapshot, filter, choice, wikiSync, wikiSyncError),
+          },
+        ],
+      };
+    }
+
+    if (wikiSync === null) {
+      log(`get_quests mislukt voor "${username}": ${wikiSyncError}`);
+      return { content: [{ type: "text", text: wikiSyncError! }], isError: true };
+    }
+
+    return { content: [{ type: "text", text: formatQuests(wikiSync, filter, choice) }] };
   },
 );
 
@@ -1242,10 +1586,19 @@ const formatMaterials = (report: MaterialsReport): string => {
   } else if (report.skillsError) {
     lines.push(`- hiscores: **niet gelezen** — ${report.skillsError}`);
   } else {
-    lines.push(
-      "- hiscores: niet opgevraagd. Geef `username` mee om ook de skill-eisen te toetsen.",
-    );
+    lines.push("- hiscores: niet opgevraagd.");
   }
+
+  // Welke van de twee de levels leverde. Altijd vermelden, ook als er niets te kiezen
+  // viel: zou deze regel alleen bij een keuze verschijnen, dan betekent zijn afwezigheid
+  // iets, en dat is precies de stilte die ORS-023 wegneemt.
+  lines.push(`- skill-levels: ${report.skillSource.reason}`);
+  lines.push(
+    ...disagreementNote(
+      report.skillDifferences,
+      "De hiscores verversen niet real-time, dus ze lopen normaal gesproken achter.",
+    ),
+  );
 
   if (failed.length > 0) {
     lines.push(

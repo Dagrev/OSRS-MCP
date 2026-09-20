@@ -19,6 +19,13 @@
  */
 
 import {
+  chooseSource,
+  localPlayerName,
+  readSkillsSnapshot,
+  type SkillsSnapshot,
+  type SourceChoice,
+} from "./authority.js";
+import {
   HiscoresError,
   fetchSkills,
   type AccountType,
@@ -115,6 +122,10 @@ export interface MaterialsReport {
   checks: RecipeCheck[];
   skills: HiscoresResult | null;
   skillsError: string | null;
+  /** Welke bron de skill-levels leverde, en waarom (ORS-023). */
+  skillSource: SourceChoice;
+  /** Waar de hiscores van een verse snapshot afweken. Leeg als er niets te vergelijken viel. */
+  skillDifferences: string[];
 }
 
 /**
@@ -160,22 +171,38 @@ const collectHoldings = (index: ItemIndex, sources: SourceStatus[]): LinkedHoldi
 };
 
 /**
- * Een skill-eis toetsen aan de hiscores. `null` als level betekent "niet
- * gerangschikt", en dat is geen level 0 — het zegt alleen dat de skill niet op
- * de hiscores staat. Dat wordt dus `onbekend`, niet `te laag`.
+ * Een skill-eis toetsen aan de bron die voorrang heeft.
+ *
+ * Bij de hiscores betekent `null` als level "niet gerangschikt", en dat is geen
+ * level 0 — het zegt alleen dat de skill niet op de hiscores staat. Dat wordt
+ * dus `onbekend`, niet `te laag`. Bij de snapshot bestaat dat onderscheid niet:
+ * daar staan alle drieëntwintig skills in, dus een skill die ontbreekt is een
+ * formaatprobleem en levert ook `onbekend` op.
+ *
+ * De snapshot geeft het échte level, niet het geboostte. Dat is hier precies
+ * goed: `boostable` staat al los in de eis, en een recept dat level 55 vraagt
+ * terwijl je 52 hebt met een potion is iets anders dan level 55 hebben.
  */
-const checkSkills = (recipe: Recipe, hiscores: HiscoresResult | null): SkillCheck[] =>
+const checkSkills = (
+  recipe: Recipe,
+  hiscores: HiscoresResult | null,
+  snapshot: SkillsSnapshot | null,
+): SkillCheck[] =>
   recipe.skills
     .filter((skill) => skill.level !== null)
     .map((skill): SkillCheck => {
       const required = skill.level!;
-      if (hiscores === null) {
-        return { name: skill.name, required, actual: null, boostable: skill.boostable, status: "onbekend" };
+
+      let actual: number | null = null;
+      if (snapshot !== null) {
+        actual = snapshot.skills[skill.name.toUpperCase()]?.level ?? null;
+      } else if (hiscores !== null) {
+        actual =
+          hiscores.skills.find(
+            (candidate) => candidate.name.toLowerCase() === skill.name.toLowerCase(),
+          )?.level ?? null;
       }
-      const entry = hiscores.skills.find(
-        (candidate) => candidate.name.toLowerCase() === skill.name.toLowerCase(),
-      );
-      const actual = entry?.level ?? null;
+
       return {
         name: skill.name,
         required,
@@ -282,6 +309,41 @@ export async function checkMaterials(request: MaterialsRequest): Promise<Materia
     }
   }
 
+  // De snapshot kan ook zónder `username` gebruikt worden, en dat is nieuw sinds ORS-023.
+  // Wie vraagt "heb ik de materialen voor X" terwijl zijn eigen client draait, hoeft zijn
+  // accountnaam niet meer in te typen om ook de levels getoetst te krijgen.
+  const snapshot = await readSkillsSnapshot();
+  const subject = request.username ?? (await localPlayerName());
+  const skillSource: SourceChoice =
+    subject === null
+      ? {
+          use: "public",
+          reason:
+            "Geen skill-bron: er is geen `username` meegegeven en er draait geen client " +
+            "waaruit af te leiden is over wie de vraag gaat. Skill-eisen blijven onbekend.",
+          snapshotAgeSeconds: snapshot?.ageSeconds ?? null,
+        }
+      : await chooseSource(subject, snapshot?.ageSeconds ?? null);
+
+  const useSnapshot = skillSource.use === "snapshot" && snapshot !== null;
+  const skillLevels = useSnapshot ? snapshot : null;
+
+  // Zijn beide bronnen er, dan wordt het verschil gemeld in plaats van stil overschreven.
+  // Extra kosten zijn er niet: de hiscores waren toch al opgehaald als er een `username`
+  // meegegeven is.
+  const skillDifferences: string[] = [];
+  if (useSnapshot && hiscores !== null) {
+    for (const entry of hiscores.skills) {
+      if (entry.name === "Overall" || entry.level === null) continue;
+      const mine = snapshot!.skills[entry.name.toUpperCase()];
+      if (mine !== undefined && mine.level !== entry.level) {
+        skillDifferences.push(
+          `${entry.name}: de hiscores zeggen level ${entry.level}, de client ${mine.level}`,
+        );
+      }
+    }
+  }
+
   const checks: RecipeCheck[] = lookup.recipes.map((recipe) => {
     const outputPerRun = recipe.outputQuantity ?? 1;
     // Bij een recept dat er twee tegelijk maakt, hoef je het maar de helft zo
@@ -298,7 +360,7 @@ export async function checkMaterials(request: MaterialsRequest): Promise<Materia
           index.byPage.has(material.name.toLowerCase()),
       ),
     );
-    const skills = checkSkills(recipe, hiscores);
+    const skills = checkSkills(recipe, hiscores, skillLevels);
 
     const uncertain =
       sourcesIncomplete || materials.some((material) => material.status === "onbekend");
@@ -327,5 +389,7 @@ export async function checkMaterials(request: MaterialsRequest): Promise<Materia
     checks,
     skills: hiscores,
     skillsError,
+    skillSource,
+    skillDifferences,
   };
 }
