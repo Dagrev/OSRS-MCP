@@ -66,7 +66,15 @@ De inspector opent in de browser. Onder **Tools** staat `ping`; die geeft
 | `set_destination` | `name` of `x`/`y`, `plane`             | Laat Shortest Path een pad naar die plek in de client tekenen.   |
 | `clear_destination` | —                                    | Haalt dat pad weer weg.                                          |
 | `plan_route`      | —                                      | De transports in de berekende route, met de items die ze vragen. |
-| `set_step`        | `instruction`, `note`, `timeoutSeconds`, `condition`, `clear` | Legt de actieve stap en zijn conditie vast in `current-step.json`. |
+| `create_task`     | `goal`, `steps`                        | Schrijft een taak (doel + stappen) naar `tasks/<id>.json`.        |
+| `list_tasks`      | —                                      | Alle taken met status en actieve stap, nieuwste eerst.            |
+| `get_task`        | `id`                                   | Eén taak: definitie en voortgang samen.                          |
+| `delete_task`     | `id`, `force`                          | Verwijdert een taak; weigert een actieve taak zonder `force`.     |
+
+Versie 1 van het Stapcontract (`set_step`, `get_run`, `update_run`, het
+run-bestand) is op 2026-09-21 verwijderd (ORS-029) nu de taak-tools hem
+volledig overnemen. Zie [[Stapcontract]] in de vault — §2 en §7 zijn daar
+vervallen verklaard.
 
 `accountType` is optioneel en is er een van `normal` (standaard), `ironman`,
 `hardcore_ironman`, `ultimate_ironman`, `group_ironman` of
@@ -392,70 +400,77 @@ Gereedschap en faciliteiten (hamer, aambeeld, zaagmolen) worden genoemd maar
 niet tegen de bank gelegd: een aambeeld ligt niet in je bank en een hamer kan
 in je toolbelt zitten.
 
-### De actieve stap (`set_step`)
+### Taken (`create_task`, `list_tasks`, `get_task`, `delete_task`)
 
-`set_step` legt één stap voor de speler vast in `current-step.json` op de
-gedeelde map: de instructie in gewone taal, en de conditie waaraan te zien is
-dat hij uitgevoerd is. De overlay in de plugin toont die stap, en een
-wachtscript wacht tot de conditie waar wordt. Het formaat staat in het
-Stapcontract in de vault (`20 Projects/OSRS stapcoach/Docs/Ontwerp/`); wijkt er
-iets af, dan hoort de wijziging in dat document en niet hier.
+Versie 2 van het Stapcontract (`20 Projects/OSRS stapcoach/Docs/Ontwerp/` in de
+vault, §8-§12): Claude plant een taak in plaats van één losse stap, en de
+plugin voert hem straks zelf af — met een taakmenu en een skip-vakje in de
+client (ORS-027/ORS-028, nog te bouwen). Deze vier tools zijn de schrijvende
+kant. Wijkt er iets af van wat hier staat, dan hoort de wijziging in het
+contract en niet hier.
 
-Er wordt **niet** op een bevestiging gewacht, en dat is het verschil met
-`set_destination`. Daar moest het wel: een `PluginMessage` aan een plugin die
-niet draait verdwijnt zonder foutmelding. Hier is de uitkomst een bestand dat
-blijft staan, en de lezers pakken het op wanneer ze er zijn. Een ack-lus zou
-alleen kosten hebben — de richting server → plugin is de trage kant.
+**Een taak** is `{ goal, steps }`. `create_task` vult zelf `id` (een datum plus
+een slug van `goal`, bijvoorbeeld `2026-09-21-woodcutting-van-40-naar-50`) en
+`createdAt` in en schrijft het geheel naar `tasks/<id>.json`. Elke stap heeft:
 
-Elke aanroep verhoogt het volgnummer. Een lezer onthoudt het nummer dat hij
-verwerkte; ziet hij een hoger nummer, dan is de stap vervangen en stopt hij met
-wachten. Draaien er twee sessies, dan overschrijven die elkaar; het volgnummer
-maakt dat zichtbaar en verder wordt het niet opgelost.
+- `instruction` — verplicht, de tekst voor de speler.
+- `destination` — optioneel, een coördinaat (`x`, `y`, `plane`, `label`). Zoek
+  hem op met `find_destination`; deze tool resolveert zelf geen namen.
+- `items` — optioneel, de spullen die de stap vraagt (`itemId`, `quantity`,
+  `name`). Matchen gaat op `itemId`, nooit op naam.
+- `condition` — verplicht als veld (de waarde mag `null` zijn), streng
+  gevalideerd tegen het conditieschema uit [[Stapcontract]] §3.3 in de vault:
+  een onbekend `type`, een onbekend veld, een verkeerd type, een negatieve
+  drempel of een `all`/`any` met minder dan twee elementen wordt geweigerd en
+  er wordt dan niets geschreven. Een relatief XP-doel (`xpGain`) wordt
+  omgerekend naar `minXp` met de stand uit `skills.json` als basis; is dat
+  bestand ouder dan 120 seconden, dan wordt het geweigerd.
 
-Wissen gaat met `clear: true` en is een eigen aanroep, niet een `set_step`
-zonder instructie. Dat laat de envelop leeg achter — instructie en conditie op
-`null` — in plaats van het laatste bevel te laten staan, en verhoogt het
-volgnummer net zo goed.
+Bij een afgekeurd veld wordt er **niets** geschreven; de melding noemt het pad
+en wat er mis is, in dezelfde vorm als bij een conditie.
 
-#### Waarom de validatie zo streng is
+#### De bankstap-regel
 
-Claude stelt de conditie zelf op en er zit niemand tussen die hem naleest. Een
-typefout in een veldnaam (`minQty` in plaats van `minQuantity`), een skill in
-kleine letters, een quest die net anders heet: dat levert een conditie op die
-er goed uitziet en nooit afgaat. De speler wacht dan tien minuten op iets dat
-technisch niet klaar kán komen.
+Een stap met een niet-lege `items`-lijst moet een stap ervóór hebben die naar
+een bank stuurt, tenzij de speler de spullen op het moment van aanmaken al in
+zijn inventory of uitrusting heeft — dat laatste wordt gecontroleerd met
+dezelfde snapshotlezers als `get_inventory` en `get_equipment`. Zonder die
+regel is een taak met een spullen-stap zonder bankmoment een planfout die pas
+na tien minuten wachten blijkt, want er is dan nergens in het plan een moment
+waarop de speler ze kán halen.
 
-Daarom wordt een conditie geweigerd — en wordt er **niets** geschreven — bij een
-onbekend `type`, een onbekend veld binnen een knoop, een ontbrekend verplicht
-veld, een verkeerd type, een onbekende `skill`, `quest`, `container` of `state`,
-een negatieve drempel, een `all` of `any` met minder dan twee elementen, of meer
-dan drie combinatoren boven elkaar of zestien bladeren. De melding noemt alles
-wat er mis is in één keer, met het pad erbij (`condition.of[1].minQuantity`) en
-waar mogelijk een suggestie: `MINNING` levert "bedoelde je MINING?" op.
+Een stap "stuurt naar een bank" als zijn `destination` binnen een paar tegels
+van een bankpunt uit de landmarktabel ligt (dezelfde tabel als
+`find_destination`) — niet via tekst in `label`, want dat zou een losse
+woordenlijst worden die het contract niet vastlegt. Is de inventory of de
+uitrusting niet te lezen op het moment van aanmaken, dan telt dat niet als
+bezit: onzekerheid is hier net zo min een "ja" als bij `check_materials`.
 
-Twee dingen zijn strenger dan het contract letterlijk eist, om dezelfde reden:
-een `minLevel` boven 99 en een `plane` boven 3 bestaan niet in het spel, dus zo'n
-conditie gaat per definitie nooit af.
+Dit is een eigen ontwerpkeuze — het ticket en het contract laten open hóe een
+stap als "bankstap" herkend wordt en hoe strikt de bezitscontrole moet zijn.
 
-De questnaam is de constante uit RuneLite's `Quest`-enum (`COOKS_ASSISTANT`),
-niet de weergavenaam. Die lijst staat in `src/questdata.ts` en is gegenereerd
-met `scripts/build-quests.mjs` uit de `runelite-api`-jar die de plugin ook
-gebruikt. Komt er een quest bij, dan moet die tabel opnieuw gegenereerd worden —
-anders weigert `set_step` een conditie die op zichzelf klopt.
+#### `list_tasks` en `get_task`
 
-#### Een relatief XP-doel
+`list_tasks` toont alle taken uit `tasks/`, nieuwste eerst (op `createdAt`),
+met de status en de actieve stap uit het voortgangsbestand — `not_started` als
+dat bestand er nog niet is. `get_task` geeft de volledige definitie en
+voortgang van één taak, met een aantekening als `player-state.json` te oud is
+om de status van zojuist te vertrouwen (contract §5, toegepast op het moment
+dat de server leest — niet op de plugin, die de client rechtstreeks leest en
+dus geen versheidsvraag heeft).
 
-"Vijftig XP erbij" kan niet als zodanig worden opgeslagen: een lezer weet dan
-niet vanaf wanneer. Geef daarom `xpGain` mee in plaats van `minXp`, dan rekent
-`set_step` het bij het schrijven om naar een absolute drempel, met de stand uit
-`skills.json` als basis. Die basis komt mee in het bestand als `baselineXp` en
-`baselineAt` — toelichting voor mens en overlay; de evaluator kijkt alleen naar
-`minXp`.
+#### `delete_task`
 
-Is `skills.json` ouder dan 120 seconden, dan wordt het geweigerd. Een basis uit
-een dode client levert een drempel op die allang gehaald is, of er nooit komt.
-Zolang de plugin dat bestand nog niet schrijft (ORS-019) werkt alleen de
-absolute vorm met `minXp`.
+Verwijdert definitie én voortgang. Weigert als de voortgang `status: "active"`
+zegt, tenzij `force: true` meegegeven wordt. Onomkeerbaar; er wordt niets
+gearchiveerd.
+
+#### Wat hier niet gebeurt
+
+Deze server raakt `tasks/<id>.progress.json` nooit aan: dat bestand is (§9)
+uitsluitend voor de plugin om te schrijven. Het conditieschema wordt hier
+gevalideerd, niet uitgerekend — dat doet de plugin straks zelf, op de
+client-API, net zoals het wachtscript dat nu al doet voor `current-step.json`.
 
 ### Twee bronnen, één antwoord (`ORS-023`)
 
@@ -541,15 +556,20 @@ De server draait als Docker-container in LXC 108 (`osrsmcp`,
 `http://192.168.1.154:3000/mcp`. Alleen LAN, plain HTTP, geen authenticatie —
 gelijk aan de Obsidian-MCP.
 
-Op drie na zijn het leestools. `set_destination` en `clear_destination` schrijven
-een opdracht naar de gedeelde map; wat zo'n opdracht kan is uitsluitend een lijn
-op de kaart laten tekenen. Zie [Bestemmingen](#bestemmingen-zetten). `set_step`
-legt de actieve stap in een bestand op diezelfde map — zie
-[De actieve stap](#de-actieve-stap-set_step). Geen van de drie klikt iets aan en
-geen van de drie verplaatst de speler.
+Op een paar na zijn het leestools. `set_destination` en `clear_destination`
+schrijven een opdracht naar de gedeelde map; wat zo'n opdracht kan is
+uitsluitend een lijn op de kaart laten tekenen. Zie
+[Bestemmingen](#bestemmingen-zetten). `create_task` en `delete_task` schrijven
+respectievelijk een taakdefinitie naar `tasks/` en verwijderen die weer — de
+plugin voert de taak zelf uit, hier wordt alleen een bestand neergezet.
+Geen van deze tools klikt iets aan en geen ervan verplaatst de speler.
 
 Intern blijft de server stdio; `supergateway` zet daar HTTP voor. Er staat geen
 netwerkcode in `src/`.
+
+`OSRS_MCP_PLAYER` en `OSRS_MCP_ACCOUNT_TYPE` in `docker-compose.yml` zijn de
+vaste waarden voor de prompt `plan_task` (ORS-026) — zie
+[De prompt plan_task](#de-prompt-plan_task).
 
 De gateway draait **stateful**: één sessie hoort bij één serverproces, en
 `SESSION_TIMEOUT` (compose, standaard 15 minuten) ruimt dat op na de laatste
@@ -682,6 +702,35 @@ naar het systeemvak minimaliseert — afsluiten via het tray-icoon.
 
 Daarna staan de tools onder het gereedschapsicoon in het invoerveld. `ping` is
 de goedkoopste test: die geeft de servertijd van de container terug.
+
+### De prompt `plan_task`
+
+De server biedt naast tools ook één MCP-prompt, `plan_task`: de planstandaard
+(`20 Projects/OSRS stapcoach/Docs/Ontwerp/Planstandaard.md` in de vault) als
+kant-en-klaar sjabloon, met accountnaam en accounttype al ingevuld. Hij bestaat
+zodat plannen er in élke client hetzelfde uitziet, zonder dat iemand de tekst
+naar clientinstructies hoeft te kopiëren (ORS-026) — dat was de reden dat een
+apart run-bestand en een eigen werkmap nodig waren.
+
+Anders dan tools staan prompts niet onder het gereedschapsicoon: Claude Desktop
+toont ze via het `+`-icoon naast het invoerveld, onder "Add from osrs-mcp" (of
+door in het veld `/` te typen en de servernaam te kiezen). Kies `plan_task`,
+vul `goal` in — bijvoorbeeld "Woodcutting van 40 naar 50" — en de ingevulde
+instructietekst gaat als bericht mee. Claude Code toont MCP-prompts als
+slash-commando: `/osrs-mcp:plan_task`.
+
+De vaste waarden komen uit twee omgevingsvariabelen op de server,
+`OSRS_MCP_PLAYER` en `OSRS_MCP_ACCOUNT_TYPE` (zie
+[Deployen op de homelab](#deployen-op-de-homelab)); staan die niet gezet, dan
+valt de prompt terug op `Mr Bilel` / `group_ironman`. De speler typt zijn naam
+en accounttype dus nooit zelf in.
+
+De prompt zelf blijft bewust kort — één scherm, zoals de planstandaard ook
+zelf voorschrijft — en verwijst voor de achtergrond (waarom een conditie op
+alleen een positie te vroeg afgaat, het uitgewerkte voorbeeld) naar het
+document in de vault. `create_task`, `find_destination` en `check_materials`
+verwijzen in hun beschrijving naar deze prompt in plaats van de standaard te
+herhalen.
 
 ### De RuneLite-kant
 

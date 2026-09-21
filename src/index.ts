@@ -59,26 +59,8 @@ import {
   type SkillsSnapshot,
   type SourceChoice,
 } from "./authority.js";
-import {
-  countLeaves,
-  describeCondition,
-  itemTargets,
-  relativeXpTargets,
-  touchesContainer,
-  validateCondition,
-  type Condition,
-} from "./condition.js";
-import {
-  StepWriteError,
-  XpBaselineError,
-  checkDataDir,
-  nextStepSeq,
-  readCurrentStep,
-  writeStep,
-  xpBaseline,
-  type StepFile,
-} from "./step.js";
-import { registerRunTools } from "./runtools.js";
+import { registerTaskTools } from "./tasktools.js";
+import { registerPlanPrompt } from "./planprompt.js";
 import { planRoute, type ItemNeed, type PlannedLeg, type RoutePlan } from "./routeplan.js";
 import { checkMaterials, type MaterialCheck, type MaterialsReport, type RecipeCheck } from "./materials.js";
 import {
@@ -1713,7 +1695,8 @@ server.registerTool(
       "uitrustingssnapshot van de RuneLite-plugin, en — als je een account meegeeft — de skill-levels uit de " +
       "hiscores. Items worden gekoppeld op item-ID, niet op naam. Wat niet te " +
       "koppelen of niet te lezen is, komt als 'onbekend' terug en nooit als 'je " +
-      "hebt het niet'.",
+      "hebt het niet'. Bij het plannen van een taak (prompt plan_task) is dit de manier " +
+      "om te bepalen of een stap zonder voorafgaande bankstap kan.",
     inputSchema: {
       item: z
         .string()
@@ -1841,7 +1824,8 @@ server.registerTool(
       "tabel komt uit Shortest Path en kent banken, altaren en teleportbestemmingen; " +
       "een willekeurige boom of een dungeon-ingang staat er niet in. Verandert niets in " +
       "het spel. Staat de gezochte plek er niet bij, geef dan de coördinaat rechtstreeks " +
-      "aan set_destination.",
+      "aan set_destination. Bij het plannen van een taak (prompt plan_task) is dit de " +
+      "manier om de `destination` van een stap te bepalen.",
     inputSchema: {
       query: z
         .string()
@@ -2311,323 +2295,10 @@ server.registerTool(
   },
 );
 
-/**
- * De actieve stap zetten of wissen — de schrijfkant van het Stapcontract.
- *
- * Alles hierboven leest; deze tool en `set_destination` zijn de enige twee die iets
- * neerleggen, en dit is de enige waar geen bevestiging op volgt. Zie de kop van
- * `step.ts` voor waarom dat hier klopt en bij een bestemming niet.
- */
-
-/** Eén foutafhandeling voor alles wat bij het schrijven van een stap mis kan gaan. */
-const stepError = (error: unknown, what: string): string => {
-  if (error instanceof StepWriteError || error instanceof PluginDataError) {
-    return error.message;
-  }
-  return `Onverwachte fout bij ${what}: ${
-    error instanceof Error ? error.message : String(error)
-  }`;
-};
-
-/** Het conditieschema, in de beschrijving van de tool zelf. */
-const CONDITION_HELP = [
-  "Een conditie is een boom van objecten met elk een `type`.",
-  "",
-  "Bladeren:",
-  "- `position`: `x`, `y`, `plane`, `radius` (alle vier verplicht, geheel). Afstand is " +
-    "Chebyshev, dus een radius is een vierkant.",
-  "- `region`: `regionId`.",
-  "- `item`: `container` (inventory/bank/equipment), `itemId`, optioneel `name` (alleen " +
-    "toelichting) en `minQuantity` (standaard 1). Matchen gaat op ID, nooit op naam.",
-  "- `skillLevel`: `skill` (hoofdletters, bv. MINING), `minLevel`. Altijd het echte level.",
-  "- `skillXp`: `skill`, plus **óf** `minXp` (absolute drempel) **óf** `xpGain` (zoveel " +
-    "XP erbij vanaf nu; wordt bij het schrijven omgerekend met de stand uit skills.json).",
-  "- `quest`: `quest` (de RuneLite-enumconstante, bv. COOKS_ASSISTANT), `state` " +
-    "(NOT_STARTED/IN_PROGRESS/FINISHED).",
-  "",
-  "Combinatoren: `all` en `any` met `of` (lijst, minstens twee), `not` met `of` (één " +
-    "conditie). Negatie is altijd een `not`-knoop, nooit een vlag op een blad. Hoogstens " +
-    "drie combinatoren boven elkaar en zestien bladeren.",
-  "",
-  "Onbekende velden en onbekende waarden worden geweigerd, en dan wordt er niets " +
-    "geschreven — liever een correctieronde dan een stap die nooit afgaat.",
-].join("\n");
-
-server.registerTool(
-  "set_step",
-  {
-    title: "De actieve stap voor de speler vastleggen",
-    description:
-      "Legt één stap vast in `current-step.json` op de gedeelde map: de instructie voor " +
-      "de speler, en de conditie waaraan te zien is dat hij uitgevoerd is. De overlay in " +
-      "de client toont de stap en het wachtscript wacht erop. **Verandert niets in het " +
-      "spel** — er wordt niet geklikt en niemand wordt verplaatst; dit zet alleen een " +
-      "bestand neer.\n\n" +
-      "Eén stap tegelijk: elke aanroep vervangt de vorige en verhoogt het volgnummer, " +
-      "zodat een lezer een verse stap van een oude kan onderscheiden. Roep de tool aan " +
-      "met `clear: true` om de stap weg te halen als de run klaar of afgebroken is.\n\n" +
-      "De conditie wordt streng gecontroleerd. Klopt er iets niet, dan wordt er **niets** " +
-      "geschreven en krijg je te horen wát er waar in de boom mis is.\n\n" +
-      CONDITION_HELP,
-    inputSchema: {
-      instruction: z
-        .string()
-        .trim()
-        .min(1, "Een instructie mag niet leeg zijn.")
-        .max(500, "Houd de instructie kort genoeg om in de overlay te passen.")
-        .optional()
-        .describe(
-          "De stap voor de speler, in gewone taal en in de gebiedende wijs: 'Hak drie " +
-            "logs bij de bomen ten noorden van Lumbridge'. Verplicht, tenzij `clear` aan staat.",
-        ),
-      note: z
-        .string()
-        .trim()
-        .min(1)
-        .max(300)
-        .optional()
-        .describe(
-          "Eén of twee zinnen toelichting, bijvoorbeeld waar het gereedschap al ligt.",
-        ),
-      timeoutSeconds: z
-        .number()
-        .int()
-        .min(10, "Minder dan tien seconden is geen stap maar een druk op de knop.")
-        .max(7200, "Langer dan twee uur op één stap wachten is geen stap meer.")
-        .optional()
-        .describe(
-          "Hoe lang het wachtscript hoogstens op deze stap wacht. Laat weg om het script " +
-            "zijn eigen standaard te laten kiezen.",
-        ),
-      condition: z
-        .record(z.string(), z.unknown())
-        .nullable()
-        .optional()
-        .describe(
-          "Waaraan te zien is dat de stap is uitgevoerd. Laat weg (of geef null) als de " +
-            "stap niet machinaal vast te stellen is — het wachtscript weigert dan te " +
-            "wachten en zegt dat erbij. Zie de beschrijving van deze tool voor het schema.",
-        ),
-      clear: z
-        .boolean()
-        .optional()
-        .describe(
-          "Wist de actieve stap. Laat dan alle andere velden weg. Het volgnummer loopt " +
-            "ook bij het wissen op, zodat een lezer ziet dat er iets veranderd is.",
-        ),
-    },
-  },
-  async ({ instruction, note, timeoutSeconds, condition, clear }) => {
-    const fail = (text: string) => ({
-      content: [{ type: "text" as const, text }],
-      isError: true,
-    });
-
-    // Wissen is een eigen aanroep, geen bijvangst van een ontbrekende instructie. Zou
-    // een weggelaten `instruction` stilzwijgend wissen, dan haalt één vergeten veld de
-    // stap van het scherm zonder dat iemand dat bedoelde.
-    if (clear === true) {
-      const extras = [
-        instruction === undefined ? null : "instruction",
-        note === undefined ? null : "note",
-        timeoutSeconds === undefined ? null : "timeoutSeconds",
-        condition === undefined ? null : "condition",
-      ].filter((name): name is string => name !== null);
-
-      if (extras.length > 0) {
-        return fail(
-          "`clear` staat aan, maar er is ook " +
-            extras.map((name) => `\`${name}\``).join(", ") +
-            " meegegeven. Wissen en zetten zijn twee verschillende aanroepen; er is " +
-            "niets geschreven.",
-        );
-      }
-    } else if (instruction === undefined) {
-      return fail(
-        "Geef een `instruction` — de stap zoals de speler hem te zien krijgt. Wil je de " +
-          "actieve stap juist weghalen, roep deze tool dan aan met `clear: true`. Er is " +
-          "niets geschreven.",
-      );
-    }
-
-    // Valideren vóór er naar de map gekeken wordt. Een afgekeurde conditie mag nooit
-    // half landen, en een fout in de conditie is iets anders dan een fout in de omgeving.
-    let validated: Condition | null = null;
-    if (clear !== true && condition !== undefined && condition !== null) {
-      const result = validateCondition(condition);
-      if (!result.ok) {
-        return fail(
-          [
-            "**De conditie is afgekeurd; er is niets geschreven.**",
-            "",
-            ...result.problems.map((problem) => `- \`${problem.path}\` ${problem.message}`),
-            "",
-            "Corrigeer de conditie en roep `set_step` opnieuw aan. De vorige stap staat " +
-              "nog onveranderd in het bestand.",
-          ].join("\n"),
-        );
-      }
-      validated = result.condition;
-    }
-
-    // Map bestaat, is leesbaar en is niet leeg — dezelfde drie gevallen als bij het
-    // lezen, hier om een verkeerde mount te betrappen vóór er een stap in het niets valt.
-    let pluginFilesPresent: boolean;
-    try {
-      ({ pluginFilesPresent } = await checkDataDir());
-    } catch (error: unknown) {
-      return fail(stepError(error, "het zetten van de stap"));
-    }
-
-    // Een relatief XP-doel kan alleen nú omgerekend worden: de basis is de stand op het
-    // moment van schrijven. Lukt dat niet, dan gaat er niets naar de map — een stap met
-    // een halve conditie is erger dan geen stap.
-    if (validated !== null) {
-      for (const target of relativeXpTargets(validated)) {
-        let baseline: { xp: number; at: string };
-        try {
-          baseline = await xpBaseline(target.node.skill);
-        } catch (error: unknown) {
-          const reason =
-            error instanceof XpBaselineError
-              ? error.message
-              : `Onverwachte fout bij het omrekenen van het XP-doel: ${
-                  error instanceof Error ? error.message : String(error)
-                }`;
-          return fail(`${reason}\n\nHet gaat om \`${target.path}\` (${target.node.skill}).`);
-        }
-
-        target.node.minXp = baseline.xp + target.node.xpGain!;
-        target.node.baselineXp = baseline.xp;
-        target.node.baselineAt = baseline.at;
-        delete target.node.xpGain;
-      }
-    }
-
-    const previous = await readCurrentStep();
-    const seq = await nextStepSeq();
-    const step: StepFile = {
-      seq,
-      issuedAt: new Date().toISOString(),
-      instruction: clear === true ? null : instruction!,
-      note: clear === true ? null : (note ?? null),
-      timeoutSeconds: clear === true ? null : (timeoutSeconds ?? null),
-      condition: clear === true ? null : validated,
-    };
-
-    let path: string;
-    try {
-      path = await writeStep(step);
-    } catch (error: unknown) {
-      return fail(stepError(error, "het zetten van de stap"));
-    }
-
-    // Geschreven, maar mogelijk in een map die niemand leest. Een mislukte CIFS-mount
-    // laat een lege map achter; schrijven lukt daar prima en de overlay ziet niets.
-    const mountWarning =
-      "\n**Er ligt geen enkel bestand van de plugin in deze map.** De stap is wel " +
-      "geschreven, maar een map zonder `player-state.json` of `inventory.json` is " +
-      "meestal een mount die niet aangehaakt is — en dan leest niemand wat hier staat. " +
-      "Controleer met `get_player_state` of de keten klopt.";
-
-    if (clear === true) {
-      const lines = [
-        `# Stap gewist (volgnummer ${seq})`,
-        "",
-        `De envelop in \`${path}\` staat nu leeg: geen instructie, geen conditie. De ` +
-          "overlay toont niets meer en het wachtscript heeft niets om op te wachten.",
-      ];
-      if (previous !== null && previous.instruction !== null) {
-        lines.push("", `De gewiste stap was: "${previous.instruction}".`);
-      }
-      if (!pluginFilesPresent) lines.push("", mountWarning.trim());
-      return { content: [{ type: "text", text: lines.join("\n") }] };
-    }
-
-    const lines = [`# Stap ${seq} gezet`, "", `- Instructie: **${instruction!}**`];
-    if (note !== undefined) lines.push(`- Toelichting: ${note}`);
-    lines.push(
-      `- Conditie: ${
-        validated === null
-          ? "**geen**"
-          : `${describeCondition(validated)} — ${nl(countLeaves(validated))} blad(eren)`
-      }`,
-      `- Wachttijd: ${
-        timeoutSeconds === undefined
-          ? "de standaard van het wachtscript"
-          : `${timeoutSeconds} seconden`
-      }`,
-      `- Geschreven naar \`${path}\` op ${step.issuedAt}.`,
-    );
-
-    if (previous !== null && previous.instruction !== null) {
-      lines.push(
-        "",
-        `Dit vervangt stap ${previous.seq} ("${previous.instruction}"). Een wachtscript ` +
-          "dat daar nog op wachtte ziet het hogere volgnummer en stopt.",
-      );
-    }
-
-    if (validated === null) {
-      lines.push(
-        "",
-        "**Er is geen conditie meegegeven.** De stap komt wel in de overlay, maar het " +
-          "wachtscript weigert erop te wachten — het kan niet vaststellen dat hij klaar " +
-          "is. Vraag de speler het zelf te melden, of zet de stap opnieuw met een conditie.",
-      );
-    }
-
-    // Een itemconditie op `inventory` voor iets dat de speler nu draagt, gaat nooit af.
-    // Dat faalt stil: het wachtscript wacht tot de timeout op gereedschap dat er allang
-    // is. Betrapt in de doorloop van 2026-09-21 met een Black axe in de uitrusting. Geen
-    // weigering maar een waarschuwing - de speler kan de bijl zo weer afdoen, en dan
-    // klopt de conditie alsnog.
-    if (validated !== null && !touchesContainer(validated, "equipment")) {
-      const wanted = itemTargets(validated, "inventory");
-      if (wanted.length > 0) {
-        try {
-          const worn = await readContainer("equipment");
-          const clashes = wanted.filter((target) =>
-            worn.items.some((item) => item.id === target.node.itemId),
-          );
-          if (clashes.length > 0) {
-            lines.push(
-              "",
-              "**Let op: dit hangt nu in de uitrusting, niet in de inventory.**",
-              ...clashes.map((target) => {
-                const wornItem = worn.items.find((item) => item.id === target.node.itemId)!;
-                return `- \`${target.path}\` vraagt item ${target.node.itemId}` +
-                  `${target.node.name ? ` (${target.node.name})` : ""}` +
-                  ` in de inventory, maar de speler draagt ${wornItem.name ?? "dat item"} nu.`;
-              }),
-              "",
-              "Zo geschreven gaat de stap pas af als het item in de inventory belandt. " +
-                "Bedoelde je \"heeft hij het bij zich\", gebruik dan een `any` over beide " +
-                "containers. De stap is wel geschreven; dit is een waarschuwing.",
-            );
-          }
-        } catch {
-          // De uitrusting niet kunnen lezen is hier geen fout: de stap staat er al en
-          // deze controle is een extra, geen voorwaarde.
-        }
-      }
-    }
-
-    if (!pluginFilesPresent) lines.push("", mountWarning.trim());
-
-    lines.push(
-      "",
-      "Er is niets veranderd in het spel: de stap staat alleen op de gedeelde map. De " +
-        "plugin leest hem via SMB, dus tussen schrijven en tonen zit ongeveer een seconde.",
-    );
-
-    return { content: [{ type: "text", text: lines.join("\n") }] };
-  },
-);
-
-// ORS-024: het run-bestand als tools, zodat een speelsessie geen paden en geen
-// code-repo meer nodig heeft. Apart bestand omdat index.ts al 2600 regels is.
-registerRunTools(server);
+registerTaskTools(server);
+// ORS-026: de planstandaard als MCP-prompt, zodat plannen vanuit elke client
+// hetzelfde werkt en niemand de tekst hoeft te kopiëren naar clientinstructies.
+registerPlanPrompt(server);
 
 async function main() {
   const transport = new StdioServerTransport();

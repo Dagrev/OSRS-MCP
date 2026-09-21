@@ -27,6 +27,10 @@ services:
       # NFS-mount niet, dan is /data leeg of afwezig en zeggen get_bank en
       # get_inventory dat de bron onbereikbaar is — niet dat de bank leeg is.
       OSRS_MCP_DATA_DIR: /data
+      # Vaste waarden voor de prompt `plan_task` (ORS-026), zodat de speler zijn naam
+      # en accounttype nooit hoeft te typen. Zelfde laag als OSRS_MCP_DATA_DIR.
+      OSRS_MCP_PLAYER: "Mr Bilel"
+      OSRS_MCP_ACCOUNT_TYPE: group_ironman
       # Hoe lang een sessie (en dus het serverproces erachter) blijft leven na
       # de laatste request. Zie de toelichting bij `--stateful` in de Dockerfile.
       SESSION_TIMEOUT: 900000
