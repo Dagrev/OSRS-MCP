@@ -19,6 +19,7 @@ import {
   RunWriteError,
   archiveCurrentRun,
   currentRunPath,
+  discardCurrentRun,
   listRuns,
   readCurrentRun,
   runsDir,
@@ -262,4 +263,51 @@ test("een vervallen stap is iets anders dan een afgevinkte", async () => {
   assert.match(done, /- \[x\] 1\./);
   assert.doesNotMatch(dropped, /\| 1\. Meel halen \|/);
   assert.match(done, /\| 1\. Meel halen \|/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Weggooien is expliciet en begrensd
+ * ------------------------------------------------------------------ */
+
+test("weggooien haalt de lopende run weg", async () => {
+  await freshDataDir({ withRunsDir: true });
+  await writeCurrentRun(SAMPLE);
+
+  await discardCurrentRun();
+
+  assert.equal(await readCurrentRun(), null);
+  assert.deepEqual(await listRuns(), []);
+});
+
+test("weggooien raakt een gearchiveerde run niet aan", async () => {
+  await freshDataDir({ withRunsDir: true });
+
+  // Een echte run uit een eerdere sessie, netjes gearchiveerd.
+  await writeCurrentRun(SAMPLE);
+  const kept = await archiveCurrentRun({
+    goal: "Cooks Assistant afronden.",
+    date: "2026-09-20",
+  });
+
+  // En daarna een toetsrun die wél weg mag.
+  await writeCurrentRun(createRunText({ goal: "Een toets.", plan: ["X"] }));
+  await discardCurrentRun();
+
+  // Het archief staat er nog, ongewijzigd. Dat is de grens uit contract paragraaf 7:
+  // weggooien raakt hoogstens de lopende run.
+  assert.deepEqual(await listRuns(), [kept]);
+  assert.equal(await readFile(join(runsDir(), kept), "utf8"), SAMPLE);
+});
+
+test("weggooien zonder lopende run is een schrijffout, geen stilte", async () => {
+  await freshDataDir({ withRunsDir: true });
+
+  await assert.rejects(
+    () => discardCurrentRun(),
+    (error: unknown) => {
+      assert.ok(error instanceof RunWriteError);
+      assert.match(error.message, /niets kwijt/);
+      return true;
+    },
+  );
 });

@@ -206,6 +206,30 @@ export const archiveCurrentRun = async (options: {
   return name;
 };
 
+/**
+ * Gooit de lopende run weg in plaats van hem te archiveren.
+ *
+ * Contract paragraaf 7: afronden archiveert, weggooien kan alleen als uitgesproken
+ * keuze op het moment van afronden. Deze functie raakt daarom uitsluitend
+ * `current-run.md` — een bestand dat al gearchiveerd is, is voor de tools onaanraakbaar,
+ * en er is geen opruimregel op leeftijd of aantal. "Niet meer nodig" is niets om te
+ * gokken; dat weet alleen wie de run afsluit.
+ */
+export const discardCurrentRun = async (): Promise<string> => {
+  const target = currentRunPath();
+  try {
+    await unlink(target);
+  } catch (error: unknown) {
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new RunWriteError(
+      "not_writable",
+      `Kon de lopende run niet weggooien ("${target}", ${code ?? "onbekende fout"}). ` +
+        `${hint(dataDir())} Het bestand staat er nog; er is niets kwijt.`,
+    );
+  }
+  return target;
+};
+
 /** Ruimt een blijven staan tijdelijk bestand op. Faalt nooit hard — het is opruimwerk. */
 export const discardTemporary = async (): Promise<void> => {
   try {

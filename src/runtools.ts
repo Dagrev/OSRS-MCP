@@ -32,6 +32,7 @@ import {
   RunWriteError,
   archiveCurrentRun,
   currentRunPath,
+  discardCurrentRun,
   readCurrentRun,
   requireDataDir,
   writeCurrentRun,
@@ -292,7 +293,10 @@ export const registerRunTools = (server: McpServer): void => {
         "- `deviation` — noteren wat er anders bleek dan gepland, of wat er nog beslist " +
         "moet worden.\n" +
         "- `finish` — de run archiveren als `YYYY-MM-DD doel.md`. Dat is een hernoeming; " +
-        "er gaat niets verloren.\n\n" +
+        "er gaat niets verloren. Was het geen echte sessie maar een toets, geef dan " +
+        "`discard: true` — dan wordt de lopende run weggegooid in plaats van bewaard. " +
+        "Dat raakt nooit een run die al gearchiveerd is, en gebeurt nooit vanzelf: " +
+        "wanneer iets niet meer nodig is, weet alleen wie de run afsluit.\n\n" +
         "**Bewerkingen zijn chirurgisch.** Alleen de regels die veranderen worden " +
         "aangeraakt. Een met de hand aangepaste steplabel, een zelf toegevoegde stap, " +
         "een eigen sectie of een eigen tabelregel blijft staan. Wie het bestand met de " +
@@ -343,6 +347,14 @@ export const registerRunTools = (server: McpServer): void => {
             "Bij `done` en `drop`: welke stap uit het plan. Laat weg om de eerstvolgende " +
               "open stap te nemen, wat bij `done` vrijwel altijd de bedoeling is.",
           ),
+        discard: z
+          .boolean()
+          .optional()
+          .describe(
+            "Alleen bij `finish`: gooi de lopende run weg in plaats van hem te " +
+              "archiveren. Voor verificatie- en toetsruns die geen verslag verdienen. " +
+              "Onomkeerbaar, maar begrensd tot `current-run.md`.",
+          ),
         conditionText: z
           .string()
           .trim()
@@ -362,6 +374,7 @@ export const registerRunTools = (server: McpServer): void => {
       note?: string;
       stepNumber?: number;
       conditionText?: string;
+      discard?: boolean;
     }) => {
       const fail = (text: string) => ({
         content: [{ type: "text" as const, text }],
@@ -379,6 +392,7 @@ export const registerRunTools = (server: McpServer): void => {
       if (action !== "done" && action !== "drop" && args.stepNumber !== undefined) {
         misplaced.push("stepNumber");
       }
+      if (action !== "finish" && args.discard !== undefined) misplaced.push("discard");
       if (action !== "active" && args.conditionText !== undefined) {
         misplaced.push("conditionText");
       }
@@ -605,6 +619,26 @@ export const registerRunTools = (server: McpServer): void => {
         goal = goalOf(text);
       } catch (error: unknown) {
         return fail(runError(error, "het archiveren van de run"));
+      }
+
+      if (args.discard === true) {
+        try {
+          await discardCurrentRun();
+        } catch (error: unknown) {
+          return fail(runError(error, "het weggooien van de run"));
+        }
+
+        return ok(
+          [
+            `Run weggegooid: "${goal}"`,
+            "",
+            summarizeSafe(text),
+            "",
+            "`current-run.md` is verwijderd en niet gearchiveerd, want `discard` stond aan. " +
+              "Dat is onomkeerbaar. Runs die al gearchiveerd waren, zijn niet aangeraakt — " +
+              "daar komt geen tool aan.",
+          ].join("\n"),
+        );
       }
 
       let name: string;
