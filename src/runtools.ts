@@ -23,7 +23,9 @@ import {
   createRunText,
   goalOf,
   nextOpenStep,
+  planOf,
   setActiveStep,
+  setPlanStatus,
   summarize,
 } from "./run.js";
 import {
@@ -300,7 +302,7 @@ export const registerRunTools = (server: McpServer): void => {
         "wordt er niets geschreven.",
       inputSchema: {
         action: z
-          .enum(["start", "active", "done", "deviation", "finish"])
+          .enum(["start", "active", "done", "drop", "deviation", "finish"])
           .describe("Welke bewerking. Zie de beschrijving van deze tool."),
         goal: z
           .string()
@@ -328,7 +330,8 @@ export const registerRunTools = (server: McpServer): void => {
           .max(300)
           .optional()
           .describe(
-            "Bij `done`: wat er anders bleek dan gepland, of leeg laten. Bij " +
+            "Bij `done`: wat er anders bleek dan gepland, of leeg laten. Bij `drop`: " +
+              "waarom de stap vervalt — dat komt onder de afwijkingen te staan. Bij " +
               "`deviation`: de afwijking zelf, en dan verplicht.",
           ),
         stepNumber: z
@@ -337,8 +340,8 @@ export const registerRunTools = (server: McpServer): void => {
           .min(1)
           .optional()
           .describe(
-            "Alleen bij `done`: welke stap uit het plan. Laat weg om de eerstvolgende " +
-              "open stap af te vinken, wat vrijwel altijd de bedoeling is.",
+            "Bij `done` en `drop`: welke stap uit het plan. Laat weg om de eerstvolgende " +
+              "open stap te nemen, wat bij `done` vrijwel altijd de bedoeling is.",
           ),
         conditionText: z
           .string()
@@ -353,7 +356,7 @@ export const registerRunTools = (server: McpServer): void => {
       },
     },
     async (args: {
-      action: "start" | "active" | "done" | "deviation" | "finish";
+      action: "start" | "active" | "done" | "drop" | "deviation" | "finish";
       goal?: string;
       plan?: string[];
       note?: string;
@@ -373,11 +376,18 @@ export const registerRunTools = (server: McpServer): void => {
       const misplaced: string[] = [];
       if (action !== "start" && args.goal !== undefined) misplaced.push("goal");
       if (action !== "start" && args.plan !== undefined) misplaced.push("plan");
-      if (action !== "done" && args.stepNumber !== undefined) misplaced.push("stepNumber");
+      if (action !== "done" && action !== "drop" && args.stepNumber !== undefined) {
+        misplaced.push("stepNumber");
+      }
       if (action !== "active" && args.conditionText !== undefined) {
         misplaced.push("conditionText");
       }
-      if (action !== "done" && action !== "deviation" && args.note !== undefined) {
+      if (
+        action !== "done" &&
+        action !== "drop" &&
+        action !== "deviation" &&
+        args.note !== undefined
+      ) {
         misplaced.push("note");
       }
       if (misplaced.length > 0) {
@@ -512,6 +522,57 @@ export const registerRunTools = (server: McpServer): void => {
               : "Geen open stappen meer — de run is toe aan `finish`.",
           ].join("\n"),
         );
+      }
+
+      if (action === "drop") {
+        // Een stap die niet meer nodig blijkt, hoort niet als `done` afgevinkt te worden.
+        // Dat gebeurde in de doorloop van 2026-09-21 wel, bij gebrek aan dit werkwoord:
+        // het run-bestand zei toen dat een stap gedaan was die nooit is uitgevoerd.
+        const target =
+          args.stepNumber !== undefined
+            ? planOf(text).find((item) => item.number === args.stepNumber)
+            : nextOpenStep(text);
+        if (!target) {
+          return fail(
+            args.stepNumber !== undefined
+              ? `Stap ${args.stepNumber} staat niet in het plan. Er is niets geschreven.`
+              : "Er staat geen open stap meer in het plan die kan vervallen. Er is niets geschreven.",
+          );
+        }
+
+        let updated: string;
+        try {
+          updated = setPlanStatus(text, target.number, "dropped");
+          // De reden hoort in het bestand zelf, anders staat er over een uur een
+          // doorgestreepte stap zonder dat iemand nog weet waarom. Een schrijfactie voor beide.
+          if (args.note !== undefined) {
+            updated = addDeviation(updated, `Stap ${target.number} vervallen: ${args.note}`);
+          }
+        } catch (error: unknown) {
+          return fail(runError(error, "het laten vervallen van een stap"));
+        }
+
+        try {
+          await writeCurrentRun(updated);
+        } catch (error: unknown) {
+          return fail(runError(error, "het laten vervallen van een stap"));
+        }
+
+        const next = nextOpenStep(updated);
+        const lines = [`Stap ${target.number} vervallen: ${target.label}`];
+        if (args.note === undefined) {
+          lines.push(
+            "Geen reden meegegeven — overweeg `note`, anders is later niet meer te zien " +
+              "waarom deze stap is weggevallen.",
+          );
+        }
+        lines.push("", summarizeSafe(updated));
+        lines.push(
+          next
+            ? `Volgende open stap: ${next.number}. ${next.label}`
+            : "Geen open stappen meer — de run is toe aan `finish`.",
+        );
+        return ok(lines.join("\n"));
       }
 
       if (action === "deviation") {

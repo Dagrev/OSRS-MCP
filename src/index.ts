@@ -62,7 +62,9 @@ import {
 import {
   countLeaves,
   describeCondition,
+  itemTargets,
   relativeXpTargets,
+  touchesContainer,
   validateCondition,
   type Condition,
 } from "./condition.js";
@@ -2573,6 +2575,42 @@ server.registerTool(
           "wachtscript weigert erop te wachten — het kan niet vaststellen dat hij klaar " +
           "is. Vraag de speler het zelf te melden, of zet de stap opnieuw met een conditie.",
       );
+    }
+
+    // Een itemconditie op `inventory` voor iets dat de speler nu draagt, gaat nooit af.
+    // Dat faalt stil: het wachtscript wacht tot de timeout op gereedschap dat er allang
+    // is. Betrapt in de doorloop van 2026-09-21 met een Black axe in de uitrusting. Geen
+    // weigering maar een waarschuwing - de speler kan de bijl zo weer afdoen, en dan
+    // klopt de conditie alsnog.
+    if (validated !== null && !touchesContainer(validated, "equipment")) {
+      const wanted = itemTargets(validated, "inventory");
+      if (wanted.length > 0) {
+        try {
+          const worn = await readContainer("equipment");
+          const clashes = wanted.filter((target) =>
+            worn.items.some((item) => item.id === target.node.itemId),
+          );
+          if (clashes.length > 0) {
+            lines.push(
+              "",
+              "**Let op: dit hangt nu in de uitrusting, niet in de inventory.**",
+              ...clashes.map((target) => {
+                const wornItem = worn.items.find((item) => item.id === target.node.itemId)!;
+                return `- \`${target.path}\` vraagt item ${target.node.itemId}` +
+                  `${target.node.name ? ` (${target.node.name})` : ""}` +
+                  ` in de inventory, maar de speler draagt ${wornItem.name ?? "dat item"} nu.`;
+              }),
+              "",
+              "Zo geschreven gaat de stap pas af als het item in de inventory belandt. " +
+                "Bedoelde je \"heeft hij het bij zich\", gebruik dan een `any` over beide " +
+                "containers. De stap is wel geschreven; dit is een waarschuwing.",
+            );
+          }
+        } catch {
+          // De uitrusting niet kunnen lezen is hier geen fout: de stap staat er al en
+          // deze controle is een extra, geen voorwaarde.
+        }
+      }
     }
 
     if (!pluginFilesPresent) lines.push("", mountWarning.trim());

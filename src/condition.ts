@@ -621,3 +621,41 @@ export const describeCondition = (condition: Condition): string => {
       return `niet: ${describeCondition(condition.of)}`;
   }
 };
+
+/**
+ * Alle itemcondities die op één bepaalde container kijken.
+ *
+ * Bedoeld om een stille faalwijze te betrappen die in de doorloop van 2026-09-21
+ * toesloeg: een stap eiste een bijl in de `inventory` terwijl de speler hem al
+ * vasthield. De conditie ging dus nooit af, en het wachtscript wachtte op gereedschap
+ * dat er allang was — zonder dat iets dat meldde. Het schema kon het geval altijd al
+ * uitdrukken (`any` over inventory en equipment); het was de auteur die het misschreef.
+ */
+export const itemTargets = (
+  condition: Condition,
+  container: ContainerName,
+  path = "condition",
+): { path: string; node: ItemCondition }[] => {
+  const found: { path: string; node: ItemCondition }[] = [];
+
+  const walk = (node: Condition, at: string): void => {
+    if (node.type === "all" || node.type === "any") {
+      node.of.forEach((child, index) => walk(child, `${at}.of[${index}]`));
+      return;
+    }
+    if (node.type === "not") {
+      walk(node.of, `${at}.of`);
+      return;
+    }
+    if (node.type === "item" && node.container === container) {
+      found.push({ path: at, node });
+    }
+  };
+
+  walk(condition, path);
+  return found;
+};
+
+/** Of er ergens in de boom al naar een container gekeken wordt. */
+export const touchesContainer = (condition: Condition, container: ContainerName): boolean =>
+  itemTargets(condition, container).length > 0;

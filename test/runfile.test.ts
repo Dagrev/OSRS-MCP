@@ -25,7 +25,13 @@ import {
   writeCurrentRun,
 } from "../src/runfile.js";
 import { clockNow, dateNow } from "../src/runtools.js";
-import { completeStep, createRunText } from "../src/run.js";
+import {
+  completeStep,
+  createRunText,
+  nextOpenStep,
+  setPlanStatus,
+  summarize,
+} from "../src/run.js";
 
 const DATA_DIR_ENV = "OSRS_MCP_DATA_DIR";
 const created: string[] = [];
@@ -221,4 +227,39 @@ test("een andere tijdzone is in te stellen", () => {
   process.env["OSRS_MCP_TIMEZONE"] = "UTC";
   assert.equal(clockNow(new Date("2026-09-21T21:30:00Z")), "21:30");
   delete process.env["OSRS_MCP_TIMEZONE"];
+});
+
+/* ------------------------------------------------------------------ *
+ * Een stap laten vervallen
+ * ------------------------------------------------------------------ */
+
+test("een vervallen stap krijgt [-] en telt niet meer als open", async () => {
+  await freshDataDir({ withRunsDir: true });
+  await writeCurrentRun(SAMPLE);
+
+  const dropped = setPlanStatus((await readCurrentRun())!, 1, "dropped");
+  await writeCurrentRun(dropped);
+
+  const after = (await readCurrentRun())!;
+  assert.match(after, /- \[-\] 1\. Meel halen/);
+  // De eerstvolgende open stap slaat de vervallen stap over.
+  assert.equal(nextOpenStep(after)?.number, 2);
+  // En de samenvatting benoemt hem apart, niet als afgerond.
+  assert.match(summarize(after), /0 van 3 stappen klaar/);
+  assert.match(summarize(after), /1 vervallen/);
+});
+
+test("een vervallen stap is iets anders dan een afgevinkte", async () => {
+  await freshDataDir({ withRunsDir: true });
+  await writeCurrentRun(SAMPLE);
+
+  const dropped = setPlanStatus(SAMPLE, 1, "dropped");
+  const done = completeStep(SAMPLE, { at: "20:15" }).text;
+
+  // Dit is precies het verschil dat in de doorloop van 2026-09-21 verloren ging: een
+  // overgeslagen stap werd als gedaan geboekt omdat er geen ander werkwoord was.
+  assert.match(dropped, /- \[-\] 1\./);
+  assert.match(done, /- \[x\] 1\./);
+  assert.doesNotMatch(dropped, /\| 1\. Meel halen \|/);
+  assert.match(done, /\| 1\. Meel halen \|/);
 });
