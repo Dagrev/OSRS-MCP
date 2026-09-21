@@ -76,6 +76,7 @@ import {
   xpBaseline,
   type StepFile,
 } from "./step.js";
+import { registerRunTools } from "./runtools.js";
 import { planRoute, type ItemNeed, type PlannedLeg, type RoutePlan } from "./routeplan.js";
 import { checkMaterials, type MaterialCheck, type MaterialsReport, type RecipeCheck } from "./materials.js";
 import {
@@ -2585,6 +2586,10 @@ server.registerTool(
     return { content: [{ type: "text", text: lines.join("\n") }] };
   },
 );
+
+// ORS-024: het run-bestand als tools, zodat een speelsessie geen paden en geen
+// code-repo meer nodig heeft. Apart bestand omdat index.ts al 2600 regels is.
+registerRunTools(server);
 
 async function main() {
   const transport = new StdioServerTransport();
