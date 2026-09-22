@@ -25,10 +25,15 @@ import {
 } from "./condition.js";
 import { XpBaselineError, xpBaseline } from "./xpbaseline.js";
 import {
-  isBankDestination,
+  conditionsOf,
+  describeTaskPosition,
+  isRepeat,
+  placedSteps,
   uniqueTaskId,
   validateTaskSteps,
+  type PlacedStep,
   type TaskDefinition,
+  type TaskElement,
   type TaskStep,
 } from "./task.js";
 import {
@@ -55,13 +60,15 @@ const taskError = (error: unknown, what: string): string => {
 const dateStamp = (now: Date = new Date()): string => now.toISOString().slice(0, 10);
 
 /** Eén regel per stap, voor de samenvatting die elke tool teruggeeft. */
-const describeStep = (step: TaskStep, index: number): string => {
-  const parts = [`${index + 1}. ${step.instruction}`];
+const describeStep = (step: TaskStep, label: string): string => {
+  const parts = [`${label}. ${step.instruction}`];
   if (step.destination !== null) {
     parts.push(
       `→ ${step.destination.label ?? `${step.destination.x}, ${step.destination.y}`}` +
         (step.destination.plane === 0 ? "" : ` (verdieping ${step.destination.plane})`),
     );
+  } else if (step.noTravel !== undefined) {
+    parts.push(`geen reis: ${step.noTravel}`);
   }
   if (step.items.length > 0) {
     parts.push(
@@ -72,16 +79,32 @@ const describeStep = (step: TaskStep, index: number): string => {
   return parts.join(" — ");
 };
 
+/** De samenvatting van een hele taak: een regel per stap, een blok met zijn stappen
+ * ingesprongen eronder. */
+const describeElements = (elements: readonly TaskElement[]): string[] =>
+  elements.flatMap((element, index) => {
+    if (!isRepeat(element)) return [`- ${describeStep(element, `${index + 1}`)}`];
+    const head =
+      `- ${index + 1}. Herhaal${element.label ? ` «${element.label}»` : ""} tot ` +
+      describeCondition(element.until) +
+      (element.maxRounds === undefined ? "" : ` (noodrem: ${nl(element.maxRounds)} rondes)`) +
+      ":";
+    return [
+      head,
+      ...element.steps.map((step, inner) => `  - ${describeStep(step, `${index + 1}.${inner + 1}`)}`),
+    ];
+  });
+
 /**
  * Dezelfde waarschuwing als bij `set_step`: een itemconditie op `inventory` die de
  * speler op dit moment juist draagt, gaat nooit vanzelf af. Geen weigering — de
  * speler kan het zo afdoen — maar wel een melding, per stap.
  */
-const wornClashWarnings = async (steps: TaskStep[]): Promise<string[]> => {
+const wornClashWarnings = async (steps: PlacedStep[]): Promise<string[]> => {
   const warnings: string[] = [];
   let worn: Awaited<ReturnType<typeof readContainer>> | null = null;
 
-  for (const [index, step] of steps.entries()) {
+  for (const { step, label } of steps) {
     if (step.condition === null || touchesContainer(step.condition, "equipment")) continue;
     const wanted = itemTargets(step.condition, "inventory");
     if (wanted.length === 0) continue;
@@ -100,7 +123,7 @@ const wornClashWarnings = async (steps: TaskStep[]): Promise<string[]> => {
       const wornItem = worn.items.find((item) => item.id === target.node.itemId);
       if (wornItem !== undefined) {
         warnings.push(
-          `stap ${index + 1}: \`${target.path}\` vraagt item ${target.node.itemId}` +
+          `stap ${label}: \`${target.path}\` vraagt item ${target.node.itemId}` +
             `${target.node.name ? ` (${target.node.name})` : ""} in de inventory, maar de ` +
             `speler draagt ${wornItem.name ?? "dat item"} nu — die conditie gaat zo nooit af.`,
         );
@@ -130,22 +153,36 @@ const ownedQuantity = async (itemId: number, kinds: ContainerKind[]): Promise<nu
 };
 
 const TASK_HELP = [
-  "Een taak is een lijst stappen die de plugin straks zelf afwerkt. Elke stap heeft:",
+  "Een taak is het **complete verloop van begin tot eind**, dat de plugin zelf afwerkt: " +
+    "voorbereiding (bank, spullen), de werkcyclus als herhaalblok (doen tot de inventory " +
+    "vol is → de opbrengst weg — bank, verbranden, fletchen of droppen, een keuze die het " +
+    "plan benoemt → terug), en afronding (de laatste opbrengst wegzetten).",
+  "",
+  "`steps` is een lijst van gewone stappen en herhaalblokken. Een **gewone stap** heeft:",
   "- `instruction`: de tekst voor de speler.",
-  "- `destination`: optioneel een coördinaat (`x`, `y`, `plane`, `label`). Zoek hem op " +
-    "met `find_destination` — deze tool resolveert geen namen.",
+  "- `destination`: verplicht. Een coördinaat (`x`, `y`, `plane`, `label`) — zoek hem op " +
+    "met `find_destination`, deze tool resolveert geen namen — of `null` met een korte " +
+    "`noTravel`-reden (\"zelfde plek als vorige stap\") als de stap echt geen reis is.",
   "- `items`: optioneel de spullen die deze stap vraagt (`itemId`, `quantity`, `name`). " +
-    "Een stap met spullen moet een stap ervoor hebben die naar een bank stuurt (een " +
-    "`destination` op een bankpunt), tenzij de speler ze nu al bij zich heeft — dat " +
-    "wordt bij het aanmaken gecontroleerd.",
+    "Een stap met spullen moet zelf naar een bank sturen of er een stap vóór hebben die " +
+    "dat doet, tenzij de speler ze nu al bij zich heeft — dat wordt bij het aanmaken " +
+    "gecontroleerd.",
   "- `condition`: verplicht veld (mag `null` zijn). Streng gevalideerd: een boom van " +
     "`position`, `region`, `item`, `skillLevel`, `skillXp` (met `minXp` of `xpGain`) en " +
     "`quest`, samengevoegd met `all`/`any`/`not`. Onbekende velden worden geweigerd.",
   "",
-  "Hoe je tot deze stappen komt — welke tools je eerst raadpleegt, de vaste vorm per " +
-    "stap, en wanneer een conditie het resultaat toetst in plaats van alleen de positie " +
-    "— staat in de prompt `plan_task`. Gebruik die om een taak op te bouwen; deze tool " +
-    "schrijft hem alleen weg en valideert.",
+  "Een **herhaalblok** is `{ \"type\": \"repeat\", \"label\"?, \"steps\": [gewone stappen], " +
+    "\"until\": <conditie>, \"maxRounds\"? }`. De plugin loopt de stappen rond tot `until` " +
+    "waar is (getoetst na elke voltooide stap en aan het begin van elke ronde); " +
+    "`maxRounds` is een noodrem. Blokken nestelen niet.",
+  "",
+  "**Plancontrole:** een `skillLevel`- of `skillXp`-conditie op een losse stap buiten een " +
+    "blok wordt geweigerd — een skilldoel is een cyclus. Dezelfde bestemming twee keer " +
+    "achter elkaar, of een plan dat eindigt met een blok zonder afronding, geeft een " +
+    "waarschuwing in het antwoord; laat die aan de speler zien.",
+  "",
+  "Hoe je tot deze stappen komt staat in de prompt `plan_task`. Gebruik die om een taak " +
+    "op te bouwen; deze tool schrijft hem alleen weg en valideert.",
 ].join("\n");
 
 export const registerTaskTools = (server: McpServer): void => {
@@ -189,7 +226,8 @@ export const registerTaskTools = (server: McpServer): void => {
           ].join("\n"),
         );
       }
-      const { steps, ownershipChecks } = validation;
+      const { steps, ownershipChecks, warnings: planWarnings } = validation;
+      const placed = placedSteps(steps);
 
       // 2. De datamap moet bereikbaar zijn vóór er iets omgerekend of geschreven wordt.
       try {
@@ -198,10 +236,9 @@ export const registerTaskTools = (server: McpServer): void => {
         return fail(taskError(error, "het aanmaken van de taak"));
       }
 
-      // 3. Relatieve XP-doelen omrekenen, per stap — zelfde regel als `set_step`.
-      for (const step of steps) {
-        if (step.condition === null) continue;
-        for (const target of relativeXpTargets(step.condition)) {
+      // 3. Relatieve XP-doelen omrekenen, per conditie (ook `until`) — zelfde regel als `set_step`.
+      for (const { condition } of conditionsOf(steps)) {
+        for (const target of relativeXpTargets(condition)) {
           try {
             const baseline = await xpBaseline(target.node.skill);
             target.node.minXp = baseline.xp + target.node.xpGain!;
@@ -228,7 +265,7 @@ export const registerTaskTools = (server: McpServer): void => {
           const have = await ownedQuantity(check.item.itemId, ["inventory", "equipment"]);
           if (have === null || have < check.item.quantity) {
             problems.push(
-              `stap ${check.stepIndex + 1}: vraagt ${check.item.quantity}× ` +
+              `stap ${check.stepLabel}: vraagt ${check.item.quantity}× ` +
                 `${check.item.name ?? check.item.itemId} zonder dat er een stap ervoor naar ` +
                 "een bank stuurt, en " +
                 (have === null
@@ -256,7 +293,8 @@ export const registerTaskTools = (server: McpServer): void => {
 
       // 5. Bijvangst: waarschuwen voor een itemconditie die nooit afgaat omdat het
       // gevraagde item nu juist gedragen wordt. Geen weigering.
-      const wornWarnings = await wornClashWarnings(steps);
+      const wornWarnings = await wornClashWarnings(placed);
+      const allWarnings = [...planWarnings, ...wornWarnings];
 
       // 6. Id bepalen en wegschrijven.
       let existingIds: string[];
@@ -285,12 +323,19 @@ export const registerTaskTools = (server: McpServer): void => {
         `# Taak aangemaakt: \`${id}\``,
         "",
         `- Doel: **${goal}**`,
-        `- ${nl(steps.length)} stap(pen), geschreven naar \`${path}\``,
+        `- ${nl(steps.length)} stap(pen)` +
+          (placed.length === steps.length ? "" : ` (${nl(placed.length)} met de stappen in blokken)`) +
+          `, geschreven naar \`${path}\``,
         "",
-        ...steps.map((step, index) => `- ${describeStep(step, index)}`),
+        ...describeElements(steps),
       ];
-      if (wornWarnings.length > 0) {
-        lines.push("", "**Let op:**", ...wornWarnings.map((w) => `- ${w}`));
+      if (allWarnings.length > 0) {
+        lines.push(
+          "",
+          "**Let op** — de taak is wél geschreven; laat dit de speler zien, en verwijder en " +
+            "maak hem opnieuw als het niet bedoeld is:",
+          ...allWarnings.map((w) => `- ${w}`),
+        );
       }
       lines.push(
         "",
@@ -365,11 +410,7 @@ export const registerTaskTools = (server: McpServer): void => {
         }
 
         const status = typeof progress?.data["status"] === "string" ? (progress.data["status"] as string) : "not_started";
-        const activeIndex = typeof progress?.data["activeStepIndex"] === "number" ? progress.data["activeStepIndex"] : null;
-        const active =
-          activeIndex === null
-            ? "—"
-            : `stap ${activeIndex + 1} van ${steps.length}`;
+        const active = describeTaskPosition(steps, progress?.data ?? null) ?? "—";
 
         rows.push({ id, goal, createdAt, status, active });
       }
@@ -447,15 +488,23 @@ export const registerTaskTools = (server: McpServer): void => {
       }
 
       const status = typeof progress.data["status"] === "string" ? progress.data["status"] : "onbekend";
-      const activeIndex =
-        typeof progress.data["activeStepIndex"] === "number" ? progress.data["activeStepIndex"] : null;
+      const position = describeTaskPosition(rawSteps, progress.data);
       const stepsProgress = Array.isArray(progress.data["steps"]) ? progress.data["steps"] : [];
-      const doneCount = stepsProgress.filter((s) => s !== null).length;
+      // Een blokregel telt als voltooid pas als het blok verlaten is (§9: `completedAt`).
+      const doneCount = stepsProgress.filter(
+        (s) => s !== null && typeof s === "object" && (s as Record<string, unknown>)["completedAt"] != null,
+      ).length;
+      const exits = stepsProgress.flatMap((s, index) =>
+        s !== null && typeof s === "object" && (s as Record<string, unknown>)["exit"] === "maxRounds"
+          ? [`blok ${index + 1} is verlaten door de noodrem (\`maxRounds\`), niet doordat het doel gehaald werd`]
+          : [],
+      );
 
       lines.push(
         `- Status: **${status}**`,
-        `- Actieve stap: ${activeIndex === null ? "onbekend" : `${activeIndex + 1} van ${rawSteps.length}`}`,
-        `- ${nl(doneCount)} van ${nl(stepsProgress.length)} stappen voltooid`,
+        `- Actieve stap: ${position ?? "onbekend"}`,
+        `- ${nl(doneCount)} van ${nl(stepsProgress.length)} stappen voltooid (een blok telt als één stap)`,
+        ...exits.map((e) => `- **Afwijking:** ${e}`),
         `- Voortgangsbestand voor het laatst gewijzigd: ${progress.fileModified}`,
       );
 
