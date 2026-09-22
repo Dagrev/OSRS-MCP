@@ -38,9 +38,12 @@ const PLAN_INSTRUCTION_TEMPLATE = `Je plant een taak voor **{{player}}** ({{acco
 haal dan ook \`get_quests\` op. Verzin nooit een level, een bezit of een queststatus —
 dat staat in de snapshot.
 
-**2. Vaste vorm per stap:** bank → benodigde spullen → plek → doen. Sla een schakel
-over als hij niet nodig is (spullen al bij de hand, geen reis nodig), maar noem hem
-niet zonder hem uit te voeren.
+**2. Vaste vorm per stap:** bank → benodigde spullen → plek → doen. De bankstap is
+er bijna altijd: ook als het gereedschap al om hangt, moet de inventory leeg voor
+een verzameltaak, en dat is een stap met een eigen conditie (de rommel is weg, het
+gereedschap is er nog). Sla een schakel alleen over als hij echt niets doet (spullen
+bij de hand én inventory al leeg, geen reis nodig), en noem hem nooit zonder hem uit
+te voeren.
 
 - **Instructie:** één handeling, gebiedende wijs, exacte namen. "Hak willows ten
   zuiden van Draynor tot je inventory vol is."
